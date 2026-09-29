@@ -1,5 +1,3 @@
-from urllib import response
-
 import frappe
 from frappe import _
 from frappe.utils import getdate
@@ -139,7 +137,7 @@ def sync_stanbic_statement(account, date_from, date_to):
 
     client = StanbicClient(
         credentials=get_bank_account_credentials(bank_account),
-        bank_account=bank_account.name
+        bank_account=bank_account.name,
     )
 
     payload = {
@@ -160,7 +158,6 @@ def sync_stanbic_statement(account, date_from, date_to):
 
     transactions = data.get("TransactionHistory", [])
 
-    # Stanbic returns these messages when there are no transactions
     no_records = (
         "No records were found that matched the selection criteria"
         in response_message
@@ -179,7 +176,6 @@ def sync_stanbic_statement(account, date_from, date_to):
             "message": "No transactions found for the selected period.",
         }
 
-    # Any other non-success response is a real error
     if not response or response_code != "00":
         error = data.get("error", {}) if data else {}
 
@@ -191,6 +187,7 @@ def sync_stanbic_statement(account, date_from, date_to):
 
     created = 0
     skipped = 0
+    failed = 0
 
     for tx in transactions:
         tx_id = tx.get("T24UniqRef")
@@ -217,20 +214,22 @@ def sync_stanbic_statement(account, date_from, date_to):
             skipped += 1
             continue
 
+        transaction_date = getdate(transaction_date)
+
         description = (
             tx.get("TxnDescr")
             or tx.get("TransactionType")
             or ""
         )
 
+        deposit = abs(amount) if amount > 0 else 0
+        withdrawal = abs(amount) if amount < 0 else 0
+
         existing = frappe.db.exists(
-            "Account Statement",
+            "Bank Transaction",
             {
-                "account": bank_account.name,
-                "reference": tx_id,
-                "date": getdate(transaction_date),
-                "amount": abs(amount),
-                "description": description,
+                "bank_account": bank_account.name,
+                "transaction_id": tx_id,
             },
         )
 
@@ -238,28 +237,35 @@ def sync_stanbic_statement(account, date_from, date_to):
             skipped += 1
             continue
 
-        statement = frappe.new_doc("Account Statement")
+        try:
+            bank_transaction = frappe.new_doc("Bank Transaction")
 
-        statement.update({
-            "account": bank_account.name,
-            "reference": tx_id,
-            "date": getdate(transaction_date),
-            "amount": abs(amount),
-            "serial": tx_id,
-            "description": description,
-            "type": "Credit" if amount > 0 else "Debit",
-        })
+            bank_transaction.update({
+                "date": transaction_date,
+                "bank_account": bank_account.name,
+                "company": bank_account.company,
+                "deposit": deposit,
+                "withdrawal": withdrawal,
+                "currency": "KES",
+                "description": description,
+                "reference_number": tx_id,
+                "transaction_id": tx_id,
+                "transaction_type": tx.get("TransactionType") or "",
+                "status": "Unreconciled",
+            })
 
-        if tx.get("RemainingBalance") is not None:
-            try:
-                statement.balance = float(
-                    tx.get("RemainingBalance")
-                )
-            except (TypeError, ValueError):
-                pass
+            bank_transaction.insert(ignore_permissions=True)
+            bank_transaction.submit()
 
-        statement.insert(ignore_permissions=True)
-        created += 1
+            created += 1
+
+        except Exception:
+            failed += 1
+
+            frappe.log_error(
+                frappe.get_traceback(),
+                f"Stanbic Bank Transaction Import Failed: {tx_id}",
+            )
 
     frappe.db.commit()
 
@@ -269,7 +275,8 @@ def sync_stanbic_statement(account, date_from, date_to):
         "transactions": len(transactions),
         "created": created,
         "skipped": skipped,
-        "message": "Statement sync completed successfully.",
+        "failed": failed,
+        "message": "Bank transactions imported successfully.",
     }
 
 def _parse_datetime(value):

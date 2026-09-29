@@ -59,13 +59,15 @@ def reconcile_account_statement(statement):
     return reconcile_statement(statement)
 
 @frappe.whitelist()
-def bulk_reconcile_statements():
+def bulk_reconcile_statements(bank=None):
+    bank_name = "Equity Bank Kenya"
+
     statements = frappe.get_all(
         "Account Statement",
         filters={
             "reconciliation_status": ["!=", "Matched"]
         },
-        pluck="name",
+        fields=["name", "account"],
     )
 
     result = {
@@ -76,34 +78,39 @@ def bulk_reconcile_statements():
         "already_matched": 0,
     }
 
-    for name in statements:
+    for statement in statements:
+        statement_bank = frappe.db.get_value(
+            "Bank Account",
+            statement.account,
+            "bank",
+        )
+
+        if statement_bank != bank_name:
+            continue
+
         result["processed"] += 1
 
         try:
             outcome = reconcile_account_statement(
-                statement=name
+                statement=statement.name
             )
 
             status = outcome.get("status")
 
             if status == "matched":
                 result["matched"] += 1
-
             elif status == "unmatched":
                 result["unmatched"] += 1
-
             elif status == "multiple_matches":
                 result["multiple_matches"] += 1
-
             elif status == "already_matched":
                 result["already_matched"] += 1
 
         except Exception:
             frappe.log_error(
                 frappe.get_traceback(),
-                "Bulk Account Statement Reconciliation",
+                "Equity Bulk Reconciliation",
             )
-
             result["unmatched"] += 1
 
     frappe.db.commit()

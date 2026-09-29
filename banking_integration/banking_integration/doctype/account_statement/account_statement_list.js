@@ -14,54 +14,19 @@ function show_bulk_reconciliation_dialog(listview) {
     const dialog = new frappe.ui.Dialog({
         title: __("Bulk Reconciliation"),
 
-        fields: [
-            {
-                fieldname: "bank",
-                fieldtype: "Select",
-                label: __("Bank"),
-                options: [
-                    "Jenga",
-                    "Stanbic",
-                    "All Banks",
-                ],
-                default: "Jenga",
-                reqd: 1,
-            },
-        ],
-
         primary_action_label: __("Reconcile"),
 
-        primary_action(values) {
+        primary_action() {
             dialog.hide();
 
-            let method;
-
-            if (values.bank === "Jenga") {
-                method =
-                    "banking_integration.api.jenga.bulk_reconcile_statements";
-            }
-
-            else if (values.bank === "Stanbic") {
-                method =
-                    "banking_integration.api.stanbic.bulk_reconcile_account_statements";
-            }
-
-            else {
-                method =
-                    "banking_integration.api.jenga.bulk_reconcile_statements";
-            }
-
             frappe.call({
-                method: method,
-
-                args: {
-                    bank: values.bank,
-                },
+                method:
+                    "banking_integration.api.jenga.bulk_reconcile_statements",
 
                 freeze: true,
 
                 freeze_message: __(
-                    "Reconciling Account Statements..."
+                    "Reconciling Jenga Account Statements..."
                 ),
 
                 callback(r) {
@@ -80,11 +45,6 @@ function show_bulk_reconciliation_dialog(listview) {
                                 : "green",
 
                         message: `
-                            <p>
-                                <strong>Bank:</strong>
-                                ${values.bank}
-                            </p>
-
                             <p>
                                 <strong>Total:</strong>
                                 ${result.total ??
