@@ -26,6 +26,18 @@ def create_bank_transfer_from_payment_entry(doc, method=None):
     if doc.docstatus != 1:
         return
 
+    # Only outbound bank payments become a Bank Transfer, and only when the
+    # source company bank account has integration explicitly enabled. This
+    # keeps all other payment entries (cash, receive, or bank accounts not
+    # opted in) behaving exactly as before.
+    if doc.payment_type != "Pay" or doc.paid_from_account_type != "Bank":
+        return
+
+    if not doc.bank_account or not frappe.db.get_value(
+        "Bank Account", doc.bank_account, "custom_integration_enabled"
+    ):
+        return
+
     # ---------------------------------------------------------
     # Prevent duplicate Bank Transfer
     # ---------------------------------------------------------

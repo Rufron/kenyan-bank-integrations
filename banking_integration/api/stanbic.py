@@ -6,6 +6,7 @@ from banking_integration.services.providers import (
     get_bank_account_credentials,
 )
 from banking_integration.services.statements import sync_stanbic_statement
+from banking_integration.clients.stanbic import StanbicClient
 
 
 @frappe.whitelist(allow_guest=True)
@@ -55,12 +56,12 @@ def fetch_statements(account, from_date, to_date):
     return result
 
 @frappe.whitelist()
-def authenticate_stanbic():
-    credentials = get_provider_credentials("Stanbic")
+def authenticate_stanbic(account: str):
+    credentials = get_bank_account_credentials(account)
 
-    client = StanbicClient(credentials)
+    client = StanbicClient(credentials, bank_account=account)
 
-    token = client.get_access_token(force_refresh=True)
+    client.get_access_token(force_refresh=True)
 
     return {
         "success": True,

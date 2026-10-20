@@ -7,27 +7,33 @@ from frappe.model.document import Document
 from frappe.utils.password import check_password
 
 
+_EQUITY_TYPES = {
+    "Internal Bank Transfer",
+    "EFT",
+    "RTGS",
+    "Pesalink Bank",
+    "Pesalink Mobile",
+    "SWIFT",
+    "Mobile Wallet",
+}
+# Only EFT and RTGS have working payload builders in _send_via_stanbic.
+# The other rails (Pesalink/B2C/Mobile/STK/Internal) are not implemented
+# yet, so they're intentionally excluded (clean validation error instead
+# of a NameError at send time).
+_STANBIC_TYPES = {
+    "EFT",
+    "RTGS",
+}
+_KCB_TYPES = set()  # TODO: fill once KCB transfer types are confirmed
+
+# Keyed by every Bank name in use (the send_money dispatcher accepts the same aliases).
 ALLOWED_TRANSFER_TYPES = {
-    "Equity Bank Kenya": {
-        "Internal Bank Transfer",
-        "EFT",
-        "RTGS",
-        "Pesalink Bank",
-        "Pesalink Mobile",
-        "SWIFT",
-        "Mobile Wallet",
-    },
-    "Stanbic Bank Kenya": {
-        "Pesalink Bank",
-        "Pesalink Mobile",
-        "RTGS",
-        "Mobile Wallet",
-        "B2C",
-        "STK Push",
-    },
-    "KCB Bank Kenya": {
-        # Add the transfer types supported by your KCB integration
-    },
+    "Equity Bank Kenya": _EQUITY_TYPES,
+    "Equity Bank": _EQUITY_TYPES,
+    "Stanbic Bank Kenya": _STANBIC_TYPES,
+    "Stanbic Bank": _STANBIC_TYPES,
+    "KCB Bank Kenya": _KCB_TYPES,
+    "Kenya Commercial Bank": _KCB_TYPES,
 }
 
 ALLOWED_ORIGIN_DOCTYPES = {
@@ -269,13 +275,17 @@ def approve_and_send(
         bank_transfer,
     )
 
+    # Failed is re-sendable: the retry reuses the same transaction_reference
+    # (see send_money), so an idempotent bank won't double-pay. Processing /
+    # Successful stay locked.
     if doc.status not in (
         "Draft",
         "Pending Approval",
+        "Failed",
     ):
         frappe.throw(
             _(
-                "Only Draft or Pending Approval "
+                "Only Draft, Pending Approval or Failed "
                 "transfers can be sent."
             )
         )

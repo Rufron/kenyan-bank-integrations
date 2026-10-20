@@ -720,7 +720,8 @@ def _send_via_stanbic(doc):
     )
 
     client = StanbicClient(
-        credentials
+        credentials,
+        bank_account=source.name,
     )
 
     reference = (
@@ -846,19 +847,46 @@ def _send_via_stanbic(doc):
         {},
     )
 
+    tx_details = response_data.get("TransactionDetails") or {}
+
     doc.bank_reference = (
         response_data.get("dbsReferenceId")
         or response_data.get("bankReferenceId")
         or response_data.get("transactionId")
         or response_data.get("reference")
+        or tx_details.get("UTN")
+        or tx_details.get("DBPUniqueTransactionNumber")
         or reference
     )
 
-    doc.status = (
-        "Successful"
-        if result.get("success")
-        else "Failed"
-    )
+    # Stanbic returns business outcomes at HTTP 200, so result["success"]
+    # (HTTP-level) is NOT the payment outcome. Rails differ: RTGS/mobile
+    # report bankStatus; EFT reports ResponseCode ("00" = success).
+    bank_status = (response_data.get("bankStatus") or "").upper()
+    tx_error = (tx_details.get("Error") or "").strip().strip(",")
+    tx_status = (tx_details.get("TransactionStatus") or "").strip()
+    response_msg = (response_data.get("ResponseMessage") or "").strip().lower()
+
+    # Stanbic returns business outcomes at HTTP 200; each rail reports
+    # success differently. NOTE: EFT success is ResponseCode/TxnStatus
+    # "001" (not "00" as the Swagger sample shows), so key off TxnStatus +
+    # Error, not ResponseCode.
+    if not result.get("success"):
+        ok = False
+    elif bank_status:
+        ok = bank_status not in (
+            "REJECTED", "FAILED", "DECLINED", "RJCT", "REVERSED",
+        )
+    elif tx_error and tx_error not in ("ERR00000", "00", "0"):
+        ok = False                       # EFT transaction-level error
+    elif tx_status:
+        ok = tx_status == "001"          # EFT: 001 success, 002 failure
+    elif response_msg:
+        ok = response_msg == "success"
+    else:
+        ok = True
+
+    doc.status = "Successful" if ok else "Failed"
 
     doc.save(ignore_permissions=True)
 
@@ -886,13 +914,13 @@ def _build_stanbic_eft_payload(
         "ExchangeRate": "",
         "CreditAmount": str(doc.amount),
         "CreditCurrency": doc.currency or "KES",
-        "PaymentDetails": (
-            doc.description or "EFT Payment"
+        "PaymentDetails": " ".join(
+            (doc.description or "EFT Payment").split()
         )[:35],
         "FxDealId": "",
         "Execute": "1",
         "PaymentType": "SBK.BCB.EFT.CREDIT",
-        "ExecutionDate": frappe.utils.today(),
+        "ExecutionDate": frappe.utils.now_datetime().strftime("%d/%m/%Y"),
         "Attachments": [],
     }
 
@@ -904,6 +932,12 @@ def _build_stanbic_rtgs_payload(
     """
     Build the Stanbic RTGS payment payload.
     """
+
+    # T24 rejects payment details over ~35 chars / with newlines
+    # ("TOO MANY CHARACTERS", error 999), so collapse whitespace and cap.
+    narrative = " ".join(
+        (doc.description or "RTGS Payment").split()
+    )[:35]
 
     return {
         "originatorAccount": {
@@ -923,13 +957,10 @@ def _build_stanbic_rtgs_payload(
 
         "dbsReferenceId": reference,
 
-        "txnNarrative": (
-            doc.description
-            or "RTGS Payment"
-        ),
+        "txnNarrative": narrative,
 
         "callBackUrl": frappe.utils.get_url(
-            "/api/method/banking_integration.banking_integration.api.callbacks.stanbic.handle_payment_notification"
+            "/api/method/banking_integration.api.callbacks.stanbic.handle_payment_notification"
         ),
 
         "transferTransactionInformation": {
@@ -971,10 +1002,7 @@ def _build_stanbic_rtgs_payload(
 
             "remittanceInformation": {
                 "type": "UNSTRUCTURED",
-                "content": (
-                    doc.description
-                    or "RTGS Payment"
-                ),
+                "content": narrative,
             },
 
             "endToEndIdentification": reference,
@@ -1014,6 +1042,7 @@ def _send_via_kcb(doc):
         doc=doc,
         source=source,
         reference=reference,
+        credentials=credentials,
     )
 
     doc.request_json = frappe.as_json(
@@ -1056,11 +1085,11 @@ def _send_via_kcb(doc):
 
 
 
-def _build_kcb_funds_transfer_payload(doc, source, reference):
-    # Using hardcoded values for the sandbox until whitelisted.
-    # Later, companyCode can be moved to Bank Integration Credentials.
+def _build_kcb_funds_transfer_payload(doc, source, reference, credentials):
+    # KE0010001 is KCB's shared sandbox company code; production sets its own.
+    company_code = credentials.get("company_code") or "KE0010001"
     return {
-        "companyCode": "KE0010001", 
+        "companyCode": company_code,
         "transactionType": "IF",
         "debitAccountNumber": source.bank_account_no, # Ensure this is the whitelisted one
         "creditAccountNumber": doc.beneficiary_account_number,

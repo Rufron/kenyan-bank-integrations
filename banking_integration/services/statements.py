@@ -140,90 +140,73 @@ def sync_stanbic_statement(account, date_from, date_to):
         bank_account=bank_account.name,
     )
 
-    payload = {
-        "FromDate": date_from.replace("-", ""),
-        "ToDate": date_to.replace("-", ""),
-    }
-
-    response = client.fetch_statements(payload)
+    # fetchTransactions takes only accountNumber; date_from/date_to are
+    # unused (the sandbox endpoint exposes no date filter).
+    response = client.fetch_transactions(
+        {"accountNumber": account_number}
+    )
 
     data = response.get("data", {}) if response else {}
 
-    response_code = data.get("ResponseCode")
-    response_message = (
-        data.get("ResponseMessage")
-        or data.get("message")
-        or ""
-    )
+    if not response or not response.get("success"):
+        frappe.throw(
+            (data.get("moreInformation") if isinstance(data, dict) else None)
+            or "Stanbic statement request failed "
+            f"(HTTP {response.get('status_code') if response else 'n/a'})."
+        )
 
-    transactions = data.get("TransactionHistory", [])
+    # The gateway returns business outcomes at HTTP 200 with an errorCode.
+    error_code = data.get("errorCode") if isinstance(data, dict) else None
 
-    no_records = (
-        "No records were found that matched the selection criteria"
-        in response_message
-        or
-        "NO RECORDS RETURNED BY ROUTINE BASED SELECTION"
-        in response_message.upper()
-    )
-
-    if no_records:
-        return {
-            "status": "success",
-            "account": account_number,
-            "transactions": 0,
-            "created": 0,
-            "skipped": 0,
-            "message": "No transactions found for the selected period.",
-        }
-
-    if not response or response_code != "00":
-        error = data.get("error", {}) if data else {}
+    if error_code and not data.get("transaction-items"):
+        # 2001 = no records for this account; not an error.
+        if str(error_code) == "2001":
+            return {
+                "status": "success",
+                "account": account_number,
+                "transactions": 0,
+                "created": 0,
+                "skipped": 0,
+                "message": "No transactions found for this account.",
+            }
 
         frappe.throw(
-            error.get("detail")
-            or response_message
-            or "Stanbic statement request failed."
+            data.get("errorMessage")
+            or f"Stanbic statement error {error_code}."
         )
+
+    transactions = data.get("transaction-items", []) or []
 
     created = 0
     skipped = 0
     failed = 0
 
     for tx in transactions:
-        tx_id = tx.get("T24UniqRef")
+        tx_id = tx.get("id")
 
-        if not tx_id:
-            skipped += 1
-            continue
+        amount_info = tx.get("transactionAmountCurrency") or {}
+        amount = amount_info.get("amount")
+        currency = amount_info.get("currencyCode") or "KES"
 
-        amount = tx.get("TxnAmount")
+        booking_date = tx.get("bookingDate")
+        indicator = (tx.get("creditDebitIndicator") or "").upper()
 
-        if amount is None:
+        if not tx_id or amount is None or not booking_date:
             skipped += 1
             continue
 
         try:
-            amount = float(amount)
+            amount = abs(float(amount))
         except (TypeError, ValueError):
             skipped += 1
             continue
 
-        transaction_date = tx.get("TransactionDate")
-
-        if not transaction_date:
-            skipped += 1
-            continue
-
-        transaction_date = getdate(transaction_date)
-
-        description = (
-            tx.get("TxnDescr")
-            or tx.get("TransactionType")
-            or ""
-        )
-
-        deposit = abs(amount) if amount > 0 else 0
-        withdrawal = abs(amount) if amount < 0 else 0
+        # shortcut: credit when the indicator starts with "C"
+        # (CRDT/CREDIT/CR/C); everything else is a debit. Revisit if
+        # Stanbic uses a different encoding.
+        is_credit = indicator.startswith("C")
+        deposit = amount if is_credit else 0
+        withdrawal = 0 if is_credit else amount
 
         existing = frappe.db.exists(
             "Bank Transaction",
@@ -241,16 +224,19 @@ def sync_stanbic_statement(account, date_from, date_to):
             bank_transaction = frappe.new_doc("Bank Transaction")
 
             bank_transaction.update({
-                "date": transaction_date,
+                "date": getdate(booking_date),
                 "bank_account": bank_account.name,
                 "company": bank_account.company,
                 "deposit": deposit,
                 "withdrawal": withdrawal,
-                "currency": "KES",
-                "description": description,
+                "currency": currency,
+                "description": (
+                    tx.get("transactionInformation")
+                    or tx.get("narrative")
+                    or ""
+                ),
                 "reference_number": tx_id,
                 "transaction_id": tx_id,
-                "transaction_type": tx.get("TransactionType") or "",
                 "status": "Unreconciled",
             })
 

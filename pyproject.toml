@@ -9,6 +9,7 @@ readme = "README.md"
 dynamic = ["version"]
 dependencies = [
     # "frappe~=16.0.0" # Installed and managed by bench.
+    "pycryptodome>=3.20",  # Crypto.* used in utils/jenga_auth.py for Jenga signatures
 ]
 
 [build-system]

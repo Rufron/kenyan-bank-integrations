@@ -4,12 +4,22 @@ from frappe import _
 from banking_integration.clients.jenga import JengaClient
 
 
+# Balance refresh is only implemented for Equity (Jenga). Other providers
+# have no balance endpoint wired up yet.
+JENGA_BANKS = {"Equity Bank", "Equity Bank Kenya"}
+
+
 @frappe.whitelist()
 def refresh_balance(bank_account):
     doc = frappe.get_doc("Bank Account", bank_account)
 
     if not doc.bank_account_no:
         frappe.throw(_("Bank Account Number is required."))
+
+    if doc.bank not in JENGA_BANKS:
+        frappe.throw(
+            _("Balance refresh is not supported for {0} yet.").format(doc.bank)
+        )
 
     client = JengaClient(bank_account=doc)
 

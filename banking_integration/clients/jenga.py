@@ -41,16 +41,20 @@ class JengaClient:
         else:
             self.base_url = credentials.production_url
 
+        # shortcut: under the dev Jenga mock, tolerate missing secrets
+        # (no live call is made). Real mode stays strict.
+        strict = not frappe.conf.get("banking_integration_mock_jenga")
+
         self.api_key = credentials.get_password(
-            "api_key"
+            "api_key", raise_exception=strict
         )
 
         self.merchant_code = credentials.get_password(
-            "merchant_code"
+            "merchant_code", raise_exception=strict
         )
 
         self.consumer_secret = credentials.get_password(
-            "consumer_secret"
+            "consumer_secret", raise_exception=strict
         )
 
     # ------------------------------------------------------------------
@@ -474,6 +478,17 @@ class JengaClient:
         payload,
         signature_string
     ):
+
+        # shortcut: dev-only Jenga mock, no live call. Remove once a real
+        # Finserve sandbox Api-Key is configured. Toggle:
+        #   bench --site <site> set-config banking_integration_mock_jenga 1
+        if frappe.conf.get("banking_integration_mock_jenga"):
+            ref = payload.get("transfer", {}).get("reference", "MOCK")
+            return {
+                "status": True,
+                "transactionId": f"MOCK-{ref}",
+                "reference": f"MOCK-{ref}",
+            }
 
         token = self.generate_token()
 

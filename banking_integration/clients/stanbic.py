@@ -86,7 +86,30 @@ class StanbicClient:
                     ├── bank_account
                     ├── client_key
                     └── client_secret
+
+        Single-auth (has_multiple_auths off) uses the top-level
+        client_id / client_secret fields instead of the child table.
         """
+
+        if not self.credentials.has_multiple_auths:
+            client_id = self.credentials.client_id
+            client_secret = self.credentials.get_password(
+                "client_secret", raise_exception=False
+            )
+
+            if not client_id or not client_secret:
+                frappe.throw(
+                    _(
+                        "Stanbic Client ID / Client Secret is not "
+                        "configured on the Bank Integration Credentials."
+                    )
+                )
+
+            return {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "row": None,
+            }
 
         if not self.bank_account:
             frappe.throw(
