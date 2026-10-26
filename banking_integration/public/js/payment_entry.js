@@ -7,6 +7,7 @@ frappe.ui.form.on("Payment Entry", {
             frm.doc.payment_type !== "Pay"
             || frm.doc.paid_from_account_type !== "Bank"
             || !frm.doc.bank_account
+            || ["Cash", "Cheque"].includes(frm.doc.mode_of_payment)
         ) {
             return;
         }

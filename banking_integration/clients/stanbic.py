@@ -198,7 +198,7 @@ class StanbicClient:
                 token_url,
                 data=payload,
                 headers=headers,
-                timeout=30,
+                timeout=60,
             )
 
         except requests.exceptions.RequestException as e:
@@ -315,7 +315,7 @@ class StanbicClient:
                 url,
                 headers=headers,
                 json=payload,
-                timeout=30,
+                timeout=60,
             )
 
         except requests.exceptions.RequestException as e:
@@ -353,7 +353,7 @@ class StanbicClient:
                 url,
                 headers=headers,
                 json=payload,
-                timeout=30,
+                timeout=60,
             )
 
         # --------------------------------------------------------------

@@ -11,6 +11,10 @@ doctype_js = {
     "Account Statement": "public/js/account_statement_list.js",
 }
 
+doctype_list_js = {
+    "Bank Transaction": "public/js/bank_transaction_list.js",
+}
+
 doc_events = {
     "Payment Entry": {
         "on_submit": (

@@ -1,39 +1,6 @@
 // Copyright (c) 2026, Nathan Wagacha and contributors
 // For license information, please see license.txt
 
-const TRANSFER_TYPES_BY_BANK = {
-    "Equity Bank Kenya": [
-        "Internal Bank Transfer",
-        "EFT",
-        "RTGS",
-        "Pesalink Bank",
-        "Pesalink Mobile",
-        "SWIFT",
-        "Mobile Wallet",
-    ],
-
-    "Stanbic Bank Kenya": [
-        "EFT",
-        "Pesalink Bank",
-        "Pesalink Mobile",
-        "RTGS",
-        "Mobile Wallet",
-        "B2C",
-        "STK Push",
-        "Internal Bank Transfer",
-    ],
-
-    "KCB Bank Kenya": [
-        "EFT",
-        "RTGS",
-        "Pesalink Bank",
-        "Pesalink Mobile",
-        "Mobile Wallet",
-        "Internal Bank Transfer",
-    ],
-};
-
-
 frappe.ui.form.on("Bank Transfer", {
 
     refresh(frm) {
@@ -57,36 +24,8 @@ frappe.ui.form.on("Bank Transfer", {
                 }
             );
         }
-
-        set_transfer_type_options(frm);
-    },
-
-    bank(frm) {
-        set_transfer_type_options(frm);
     },
 });
-
-
-function set_transfer_type_options(frm) {
-    const options =
-        TRANSFER_TYPES_BY_BANK[frm.doc.bank] || [];
-
-    frm.set_df_property(
-        "transfer_type",
-        "options",
-        options.join("\n")
-    );
-
-    if (
-        frm.doc.transfer_type &&
-        !options.includes(frm.doc.transfer_type)
-    ) {
-        frm.set_value(
-            "transfer_type",
-            ""
-        );
-    }
-}
 
 
 function confirm_and_send_transfer(frm) {
