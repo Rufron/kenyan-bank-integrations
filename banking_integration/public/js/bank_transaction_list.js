@@ -2,13 +2,23 @@
 // Duplicated from the Account Statement form (account_statement.js) for
 // easier access; the Account Statement copy will be removed later.
 
-frappe.listview_settings["Bank Transaction"] = {
-    onload(listview) {
-        listview.page.add_inner_button(
-            __("Get Statement"),
-            () => bt_show_statement_dialog(listview)
-        );
-    },
+// Extend (don't replace) ERPNext's settings, so its get_indicator
+// (Reconciled / Unreconciled) and add_fields are preserved.
+frappe.listview_settings["Bank Transaction"] =
+    frappe.listview_settings["Bank Transaction"] || {};
+
+const _bt_prev_onload =
+    frappe.listview_settings["Bank Transaction"].onload;
+
+frappe.listview_settings["Bank Transaction"].onload = function (listview) {
+    if (_bt_prev_onload) {
+        _bt_prev_onload(listview);
+    }
+
+    listview.page.add_inner_button(
+        __("Get Statement"),
+        () => bt_show_statement_dialog(listview)
+    );
 };
 
 
