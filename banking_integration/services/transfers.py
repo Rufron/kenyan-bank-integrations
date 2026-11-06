@@ -944,8 +944,12 @@ def _build_stanbic_rtgs_payload(
             "identification": {
                 "identification": source.bank_account_no,
                 "debitCurrency": doc.currency or "KES",
+                # T24 blanks DEBIT.THEIR.REF if the originator mobile is
+                # empty, so it must be populated for RTGS. Comes from the
+                # source Bank Account (custom_sender_mobile_number).
                 "mobileNumber": (
-                    doc.sender_mobile_number
+                    source.get("custom_sender_mobile_number")
+                    or doc.sender_mobile_number
                     or ""
                 ),
             }
@@ -1005,7 +1009,10 @@ def _build_stanbic_rtgs_payload(
                 "content": narrative,
             },
 
-            "endToEndIdentification": reference,
+            # Must be DISTINCT from dbsReferenceId — if the two references
+            # are identical, T24 blanks DEBIT.THEIR.REF ("INPUT MISSING").
+            # Confirmed against a working payload where they differ.
+            "endToEndIdentification": "E2E" + reference,
         },
     }
 
