@@ -7,7 +7,6 @@ from banking_integration.services.providers import (
 )
 from banking_integration.services.reconciliation import reconcile_statement
 from banking_integration.services.statements import sync_jenga_statement
-from banking_integration.services.transfers import send_money
 
 
 @frappe.whitelist()
@@ -34,10 +33,6 @@ def test_connection(account: str):
 def get_account_balance(account: str):
     return refresh_balance(account)
 
-
-@frappe.whitelist()
-def send_transfer(transfer: str):
-    return send_money(transfer)
 
 @frappe.whitelist()
 def import_jenga_statement(

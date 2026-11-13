@@ -3,9 +3,10 @@
 
 import frappe
 from frappe import _
-from frappe.utils import today
+from frappe.utils import flt, today
 
 from banking_integration.clients.jenga import JengaClient
+from banking_integration.clients.ncba import NCBAClient
 from banking_integration.clients.stanbic import StanbicClient
 from banking_integration.clients.kcb import KCBClient
 from banking_integration.services.balances import refresh_balance
@@ -44,6 +45,10 @@ def send_money(bank_transfer: str):
         bank_transfer,
     )
 
+    # Only approve_and_send (approver role + authenticator code) may release money.
+    if frappe.flags.get("bank_transfer_approved") != doc.name:
+        frappe.throw(_("Bank Transfers can only be sent through Approve & Send."), frappe.PermissionError)
+
     if doc.status != "Approved":
         frappe.throw(
             _(
@@ -58,6 +63,9 @@ def send_money(bank_transfer: str):
     "Equity Bank": _send_via_jenga,
     "Stanbic Bank": _send_via_stanbic,
     "Kenya Commercial Bank": _send_via_kcb,
+    "NCBA": _send_via_ncba,
+    "NCBA Bank": _send_via_ncba,
+    "NCBA Bank Kenya": _send_via_ncba,
 }.get(doc.bank)
 
     if not dispatcher:
@@ -765,15 +773,15 @@ def _send_via_stanbic(doc):
 
         endpoint = "/api/sandbox/rtgs-payments/"
 
-    elif doc.transfer_type == "B2C":
+    elif doc.transfer_type == "SWIFT":
 
-        payload = _build_stanbic_b2c_payload(
+        payload = _build_stanbic_swift_payload(
             doc=doc,
             source=source,
             reference=reference,
         )
 
-        endpoint = "/api/sandbox/stanbic-payments/"
+        endpoint = StanbicClient.SWIFT_PATH
 
     elif doc.transfer_type == "Mobile Wallet":
 
@@ -785,16 +793,6 @@ def _send_via_stanbic(doc):
 
         endpoint = "/api/sandbox/mobile-payments/"
 
-    elif doc.transfer_type == "STK Push":
-
-        payload = _build_stanbic_stk_payload(
-            doc=doc,
-            source=source,
-            reference=reference,
-        )
-
-        endpoint = "/api/sandbox/mpesa-checkout/"
-
     elif doc.transfer_type == "Internal Bank Transfer":
 
         payload = _build_stanbic_internal_transfer_payload(
@@ -803,7 +801,7 @@ def _send_via_stanbic(doc):
             reference=reference,
         )
 
-        endpoint = "/api/sandbox/inter-account-transfer/"
+        endpoint = StanbicClient.STANBIC_PAYMENT_PATH
 
     else:
 
@@ -924,6 +922,146 @@ def _build_stanbic_eft_payload(
         "Attachments": [],
     }
 
+def _stanbic_mobile(number):
+    """Stanbic expects 2547XXXXXXXX; accept 07XX / +254 / spaced input."""
+    digits = "".join(ch for ch in str(number or "") if ch.isdigit())
+    if len(digits) == 10 and digits.startswith("0"):
+        return "254" + digits[1:]
+    return digits
+
+
+def _stanbic_common(doc, reference, default_narrative):
+    """Fields shared by Stanbic's Pesalink, SWIFT and mobile payment requests."""
+    narrative = " ".join((doc.description or default_narrative).split())[:35]
+    return narrative, {
+        "requestedExecutionDate": frappe.utils.today(),
+        "dbsReferenceId": reference,
+        "txnNarrative": narrative,
+        "callBackUrl": frappe.utils.get_url(
+            "/api/method/banking_integration.api.callbacks.stanbic.handle_payment_notification"
+        ),
+    }
+
+
+def _build_stanbic_pesalink_payload(doc, source, reference):
+    narrative, payload = _stanbic_common(doc, reference, "Pesalink Payment")
+    if not doc.bank_code:
+        frappe.throw(_("The beneficiary's Bank Account needs a Bank Code for Pesalink."))
+    payload.update({
+        "originatorAccount": {"identification": {"mobileNumber": _stanbic_mobile(source.get("custom_sender_mobile_number"))}},
+        "sendMoneyTo": "ACCOUNT.NUMBER",
+        "transferTransactionInformation": {
+            "instructedAmount": {"amount": f"{flt(doc.amount):.2f}", "currencyCode": doc.currency or "KES"},
+            "counterpartyAccount": {
+                "identification": {
+                    "recipientMobileNo": doc.beneficiary_mobile_number or "",
+                    "recipientBankAcctNo": doc.beneficiary_account_number,
+                    "recipientBankCode": doc.bank_code,
+                }
+            },
+            "counterparty": {
+                "name": doc.beneficiary_name,
+                "postalAddress": {"addressLine": "KENYA", "postCode": "00100", "town": "Nairobi", "country": "KE"},
+            },
+            "remittanceInformation": {"type": "UNSTRUCTURED", "content": narrative},
+            "endToEndIdentification": "E2E" + reference,
+        },
+    })
+    return payload
+
+
+def _build_stanbic_swift_payload(doc, source, reference):
+    narrative, payload = _stanbic_common(doc, reference, "SWIFT Payment")
+    if not doc.bank_bic:
+        frappe.throw(_("The beneficiary's Bank needs a SWIFT number for SWIFT payments."))
+    payload.update({
+        "originatorAccount": {
+            "identification": {
+                "identification": source.bank_account_no,
+                "debitCurrency": doc.currency or "KES",
+                "mobileNumber": _stanbic_mobile(source.get("custom_sender_mobile_number")),
+            }
+        },
+        "transferTransactionInformation": {
+            "instructedAmount": {
+                "amount": f"{flt(doc.amount):.2f}",
+                "creditCurrency": doc.destination_currency or doc.currency or "KES",
+            },
+            "counterpartyAccount": {
+                "identification": {
+                    "identification": doc.beneficiary_account_number,
+                    # Stanbic's sample formats the beneficiary bank as "SW-" + BIC.
+                    "beneficiaryBank": "SW-" + doc.bank_bic,
+                }
+            },
+            "counterparty": {
+                "name": doc.beneficiary_name,
+                "postalAddress": {
+                    "addressLine": doc.beneficiary_address or "KENYA",
+                    "country": doc.beneficiary_country or "KE",
+                },
+            },
+            "remittanceInformation": {"type": "UNSTRUCTURED", "content": narrative},
+            "endToEndIdentification": "E2E" + reference,
+        },
+    })
+    return payload
+
+
+def _build_stanbic_mobile_payload(doc, source, reference):
+    if not doc.beneficiary_mobile_number:
+        frappe.throw(_("A beneficiary mobile number is required for Mobile Wallet payments."))
+
+    narrative, payload = _stanbic_common(doc, reference, "Mobile Payment")
+    payload.update({
+        "originatorAccount": {"identification": {"mobileNumber": _stanbic_mobile(source.get("custom_sender_mobile_number"))}},
+        "transferTransactionInformation": {
+            "instructedAmount": {"amount": f"{flt(doc.amount):.2f}", "currencyCode": doc.currency or "KES"},
+            "mobileMoneyMno": {"name": doc.wallet_name or "MPESA"},
+            "counterparty": {"name": doc.beneficiary_name, "mobileNumber": doc.beneficiary_mobile_number},
+            "remittanceInformation": {"type": "UNSTRUCTURED", "content": narrative},
+            "endToEndIdentification": "E2E" + reference,
+        },
+    })
+    return payload
+
+
+def _build_stanbic_internal_transfer_payload(
+    doc,
+    source,
+    reference,
+):
+    """Stanbic-to-Stanbic payment (stanbic-payments API). The debit account comes from the API key."""
+    narrative = " ".join((doc.description or "Internal Transfer").split())[:35]
+
+    return {
+        "originatorAccount": {
+            "identification": {
+                "mobileNumber": _stanbic_mobile(source.get("custom_sender_mobile_number") or doc.sender_mobile_number),
+            }
+        },
+        "requestedExecutionDate": frappe.utils.today(),
+        "dbsReferenceId": reference,
+        "txnNarrative": narrative,
+        "callBackUrl": frappe.utils.get_url(
+            "/api/method/banking_integration.api.callbacks.stanbic.handle_payment_notification"
+        ),
+        "transferTransactionInformation": {
+            "instructedAmount": {
+                "amount": f"{flt(doc.amount):.2f}",
+                "currencyCode": doc.currency or "KES",
+            },
+            "counterparty": {"name": doc.beneficiary_name},
+            "counterpartyAccount": {
+                "identification": {"identification": doc.beneficiary_account_number},
+            },
+            "remittanceInformation": {"type": "UNSTRUCTURED", "content": narrative},
+            # Kept distinct from dbsReferenceId, as T24 requires for RTGS.
+            "endToEndIdentification": "E2E" + reference,
+        },
+    }
+
+
 def _build_stanbic_rtgs_payload(
     doc,
     source,
@@ -947,10 +1085,9 @@ def _build_stanbic_rtgs_payload(
                 # T24 blanks DEBIT.THEIR.REF if the originator mobile is
                 # empty, so it must be populated for RTGS. Comes from the
                 # source Bank Account (custom_sender_mobile_number).
-                "mobileNumber": (
+                "mobileNumber": _stanbic_mobile(
                     source.get("custom_sender_mobile_number")
                     or doc.sender_mobile_number
-                    or ""
                 ),
             }
         },
@@ -1107,6 +1244,137 @@ def _build_kcb_funds_transfer_payload(doc, source, reference, credentials):
         "beneficiaryDetails": doc.beneficiary_name[:35], # Enforcing KCB's 35 char limit
         "beneficiaryBankCode": doc.bank_code,
     }
+# =====================================================================
+# NCBA
+# =====================================================================
+
+
+def _send_via_ncba(doc):
+    source = frappe.get_doc("Bank Account", doc.source_account)
+    client = NCBAClient(get_bank_account_credentials(source))
+
+    # NCBA rejects non-alphanumeric TransactionIDs; generate_reference() is digits only.
+    # A retried transfer reuses its reference so NCBA can reject the duplicate.
+    doc.transaction_reference = doc.transaction_reference or generate_reference()
+
+    builder, path = {
+        "Internal Bank Transfer": (_build_ncba_ift_payload, NCBAClient.IFT_PATH),
+        "EFT": (_build_ncba_eft_payload, NCBAClient.EFT_PATH),
+        "Pesalink Bank": (_build_ncba_pesalink_payload, NCBAClient.PESALINK_PATH),
+        "RTGS": (_build_ncba_rtgs_payload, NCBAClient.RTGS_PATH),
+    }.get(doc.transfer_type, (None, None))
+
+    if not builder:
+        frappe.throw(_("NCBA transfer type {0} is not supported.").format(doc.transfer_type))
+
+    payload = builder(doc, source)
+    doc.request_json = frappe.as_json(payload, indent=2)
+
+    response = client.post(path, payload)
+    doc.response_json = frappe.as_json(response, indent=2)
+
+    # "000" means NCBA accepted it. EFT settles T+1 and RTGS within ~3h, but
+    # NCBA reports no later failure for them, so acceptance is final here.
+    doc.bank_reference = response.get("txnReferenceNo") or doc.bank_reference
+    doc.status = "Successful" if response.get("resultCode") == "000" else "Failed"
+
+    doc.save(ignore_permissions=True)
+    frappe.db.commit()
+
+    return response
+
+
+def _ncba_amount(doc):
+    return f"{flt(doc.amount):.2f}"
+
+
+def _ncba_sender_cif(source):
+    # NCBA: "first 6 digits of the sender account number" unless the bank assigned another.
+    return source.bank_account_no[:6]
+
+
+def _ncba_bank_code(doc):
+    if not doc.bank_code:
+        frappe.throw(
+            _("Beneficiary bank code is missing. Set Bank Code on the supplier's Bank Account.")
+        )
+    return doc.bank_code
+
+
+def _build_ncba_ift_payload(doc, source):
+    return {
+        "country": "Kenya",
+        "transactionID": doc.transaction_reference,
+        "beneficiaryAccountName": doc.beneficiary_name,
+        "debitAccountNumber": source.bank_account_no,
+        "creditAccountNumber": doc.beneficiary_account_number,
+        "currency": doc.currency,
+        "amount": _ncba_amount(doc),
+        "narration": doc.description,
+    }
+
+
+def _build_ncba_eft_payload(doc, source):
+    return {
+        "amount": _ncba_amount(doc),
+        "beneficiaryAccountNumber": doc.beneficiary_account_number,
+        # bank + branch code, e.g. 07000
+        "beneficiaryBankBIC": _ncba_bank_code(doc),
+        "beneficiaryName": doc.beneficiary_name,
+        "currency": doc.currency,
+        "debitAccountNumber": source.bank_account_no,
+        "narration": doc.description,
+        "senderCountry": "Kenya",
+        "transactionID": doc.transaction_reference,
+        "senderCIF": _ncba_sender_cif(source),
+    }
+
+
+def _build_ncba_pesalink_payload(doc, source):
+    return {
+        "beneficiaryAccountNumber": doc.beneficiary_account_number,
+        # NCBA wants the 2-digit bank code prefixed with "00", e.g. Equity 68 -> 0068.
+        "beneficiaryBankBIC": "00" + _ncba_bank_code(doc)[:2],
+        "beneficiaryName": doc.beneficiary_name,
+        "amount": _ncba_amount(doc),
+        "currency": doc.currency,
+        "narration": doc.description,
+        "senderAccountNumber": source.bank_account_no,
+        "senderCIF": _ncba_sender_cif(source),
+        "senderCountry": "Kenya",
+        "transactionID": doc.transaction_reference,
+    }
+
+
+def _build_ncba_rtgs_payload(doc, source):
+    if not doc.bank_bic:
+        frappe.throw(
+            _("RTGS needs the beneficiary bank's SWIFT code. Set SWIFT Number on Bank {0}.").format(
+                frappe.db.get_value("Bank Account", doc.destination_account, "bank") or ""
+            )
+        )
+
+    if not doc.purpose_code:
+        frappe.throw(_("RTGS needs a CBK Purpose of Payment code."))
+
+    return {
+        "beneficiaryAccountNumber": doc.beneficiary_account_number,
+        "beneficiaryBankBIC": doc.bank_bic,
+        "beneficiaryCountry": "KE",
+        "beneficiaryName": doc.beneficiary_name,
+        "beneficiaryAddress": doc.beneficiary_address or "Nairobi",
+        "creditAmount": _ncba_amount(doc),
+        "debitCurrency": doc.currency,
+        "creditCurrency": doc.destination_currency or doc.currency,
+        "narration": doc.description,
+        "senderAccountNumber": source.bank_account_no,
+        "senderCIF": _ncba_sender_cif(source),
+        "senderCountry": "KE",
+        "purposeCode": doc.purpose_code,
+        "transactionID": doc.transaction_reference,
+    }
+
+
 # =====================================================================
 # HELPERS
 # =====================================================================

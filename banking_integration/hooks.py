@@ -9,10 +9,15 @@ doctype_js = {
     "Payment Entry": "public/js/payment_entry.js",
     "Bank Account": "public/js/bank_account.js",
     "Account Statement": "public/js/account_statement_list.js",
+    "User": "public/js/user.js",
 }
 
 doctype_list_js = {
     "Bank Transaction": "public/js/bank_transaction_list.js",
+}
+
+extend_doctype_class = {
+    "Payment Entry": "banking_integration.overrides.payment_entry.PaymentEntryMixin",
 }
 
 doc_events = {
@@ -27,8 +32,8 @@ doc_events = {
         ),
     }
 }
-doctype_dashboards = {
-    "Payment Entry": "banking_integration.banking_integration.doctype.payment_entry.payment_entry_dashboard"
+override_doctype_dashboards = {
+    "Payment Entry": ["banking_integration.overrides.payment_entry_dashboard.get_data"]
 }
 
 fixtures = [
@@ -37,7 +42,8 @@ fixtures = [
         "filters": [
             ["dt", "in", ["Payment Entry", "Bank Account"]]
         ],
-    }
+    },
+    {"dt": "Role", "filters": [["name", "=", "Bank Transfer Approver"]]},
 ]
 
 # Apps

@@ -48,6 +48,17 @@ function bt_show_statement_dialog(listview) {
                 reqd: 1,
                 default: frappe.datetime.get_today(),
             },
+            {
+                fieldname: "stanbic_source",
+                fieldtype: "Select",
+                label: __("Stanbic Source"),
+                options: [
+                    { value: "transactions", label: __("Latest transactions") },
+                    { value: "statement", label: __("Online Account Statement (date range)") },
+                ],
+                default: "transactions",
+                hidden: 1,
+            },
         ],
 
         primary_action_label: __("Import"),
@@ -82,10 +93,24 @@ function bt_show_statement_dialog(listview) {
                     return;
                 }
 
+                const bank_lower = bank.toLowerCase();
                 const method =
-                    bank.toLowerCase().includes("stanbic")
+                    bank_lower.includes("stanbic")
                         ? "banking_integration.api.stanbic.fetch_statements"
-                        : "banking_integration.api.jenga.import_jenga_statement";
+                        : bank_lower.startsWith("ncba")
+                            ? "banking_integration.api.ncba.fetch_statements"
+                            : bank_lower.includes("equity")
+                                ? "banking_integration.api.jenga.import_jenga_statement"
+                                : null;
+
+                if (!method) {
+                    frappe.msgprint({
+                        title: __("Not Supported"),
+                        message: __("Statement import is not available for {0} yet.", [bank]),
+                        indicator: "orange",
+                    });
+                    return;
+                }
 
                 frappe.call({
                     method,
@@ -94,6 +119,7 @@ function bt_show_statement_dialog(listview) {
                         account: values.account,
                         from_date: values.from_date,
                         to_date: values.to_date,
+                        ...(bank_lower.includes("stanbic") ? { source: values.stanbic_source } : {}),
                     },
 
                     freeze: true,
@@ -107,6 +133,16 @@ function bt_show_statement_dialog(listview) {
             });
         },
     });
+
+    // Show the Stanbic source choice only for Stanbic accounts.
+    dialog.fields_dict.account.df.onchange = () => {
+        const account = dialog.get_value("account");
+        if (!account) return dialog.set_df_property("stanbic_source", "hidden", 1);
+        frappe.db.get_value("Bank Account", account, "bank").then((r) => {
+            const is_stanbic = ((r.message && r.message.bank) || "").toLowerCase().includes("stanbic");
+            dialog.set_df_property("stanbic_source", "hidden", is_stanbic ? 0 : 1);
+        });
+    };
 
     dialog.show();
 }
@@ -125,6 +161,7 @@ function bt_show_import_result(result, bank) {
             <p><strong>Transactions:</strong> ${result.transactions || 0}</p>
             <p><strong>Created:</strong> ${result.created || 0}</p>
             <p><strong>Skipped:</strong> ${result.skipped || 0}</p>
+            ${result.message ? `<p><strong>Note:</strong> ${frappe.utils.escape_html(result.message)}</p>` : ""}
             ${
                 result.balance !== undefined
                     ? `<p><strong>Balance:</strong> ${result.balance} ${result.currency || ""}</p>`

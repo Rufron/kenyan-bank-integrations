@@ -17,30 +17,50 @@ ALLOWED_TRANSFER_TYPES = {
 }
 
 
+def is_bank_transfer_flow(doc):
+    """True when submitting this Payment Entry will create a Bank Transfer."""
+
+    # Physical instruments never trigger an electronic transfer, even when
+    # drawn on an integration-enabled bank account.
+    if doc.mode_of_payment in ("Cash", "Cheque"):
+        return False
+
+    # Only outbound bank payments become a Bank Transfer, and only when the
+    # source company bank account has integration explicitly enabled. This
+    # keeps all other payment entries (cash, receive, or bank accounts not
+    # opted in) behaving exactly as before.
+    if doc.payment_type not in ("Pay", "Internal Transfer") or doc.paid_from_account_type != "Bank":
+        return False
+
+    source = get_source_bank_account(doc)
+    return bool(
+        source
+        and frappe.db.get_value("Bank Account", source, "custom_integration_enabled")
+    )
+
+
+def get_source_bank_account(doc):
+    """Pay uses the Company Bank Account field; Internal Transfer has none, so match the Paid From ledger."""
+    if doc.payment_type == "Internal Transfer":
+        return _company_bank_account_for(doc.paid_from, doc.company)
+    return doc.bank_account
+
+
+def _company_bank_account_for(account, company):
+    return frappe.db.get_value(
+        "Bank Account",
+        {"account": account, "company": company, "is_company_account": 1, "disabled": 0},
+        "name",
+    )
+
+
 @frappe.whitelist()
 def create_bank_transfer_from_payment_entry(doc, method=None):
 
     if isinstance(doc, str):
         doc = frappe.get_doc("Payment Entry", doc)
 
-    if doc.docstatus != 1:
-        return
-
-    # Physical instruments never trigger an electronic transfer, even when
-    # drawn on an integration-enabled bank account.
-    if doc.mode_of_payment in ("Cash", "Cheque"):
-        return
-
-    # Only outbound bank payments become a Bank Transfer, and only when the
-    # source company bank account has integration explicitly enabled. This
-    # keeps all other payment entries (cash, receive, or bank accounts not
-    # opted in) behaving exactly as before.
-    if doc.payment_type != "Pay" or doc.paid_from_account_type != "Bank":
-        return
-
-    if not doc.bank_account or not frappe.db.get_value(
-        "Bank Account", doc.bank_account, "custom_integration_enabled"
-    ):
+    if doc.docstatus != 1 or not is_bank_transfer_flow(doc):
         return
 
     # ---------------------------------------------------------
@@ -62,7 +82,9 @@ def create_bank_transfer_from_payment_entry(doc, method=None):
     # Validate source Bank Account
     # ---------------------------------------------------------
 
-    if not doc.bank_account:
+    source_bank_account = get_source_bank_account(doc)
+
+    if not source_bank_account:
         frappe.throw(
             _("Company Bank Account is required.")
         )
@@ -70,7 +92,7 @@ def create_bank_transfer_from_payment_entry(doc, method=None):
     source_account = frappe.db.get_value(
         "Bank Account",
         {
-            "name": doc.bank_account,
+            "name": source_bank_account,
             "company": doc.company,
         },
         "name",
@@ -79,10 +101,30 @@ def create_bank_transfer_from_payment_entry(doc, method=None):
     if not source_account:
         frappe.throw(
             _("Bank Account {0} was not found.").format(
-                doc.bank_account
+                source_bank_account
             )
         )
 
+    if doc.payment_type == "Internal Transfer":
+        destination_account = _company_bank_account_for(doc.paid_to, doc.company)
+        if not destination_account:
+            frappe.throw(
+                _("No company Bank Account is linked to {0} (Account Paid To).").format(doc.paid_to)
+            )
+        beneficiary_name = doc.company
+    elif get_transfer_type(doc) == "Mobile Wallet":
+        # Mobile money goes to a phone number, so the party needs no bank account.
+        if not doc.get("custom_beneficiary_mobile"):
+            frappe.throw(_("Enter the recipient's mobile number for a Mobile Wallet payment."))
+        destination_account = doc.party_bank_account
+        beneficiary_name = doc.party_name or doc.party
+    else:
+        destination_account, beneficiary_name = _party_destination(doc)
+
+    return _create_transfer(doc, source_account, destination_account, beneficiary_name)
+
+
+def _party_destination(doc):
     # ---------------------------------------------------------
     # Validate party
     # ---------------------------------------------------------
@@ -96,7 +138,8 @@ def create_bank_transfer_from_payment_entry(doc, method=None):
     # Find destination Bank Account
     # ---------------------------------------------------------
 
-    destination_account = get_party_bank_account(
+    # The account chosen on the Payment Entry wins; parties can hold several.
+    destination_account = doc.party_bank_account or get_party_bank_account(
         party_type=doc.party_type,
         party=doc.party,
     )
@@ -111,6 +154,10 @@ def create_bank_transfer_from_payment_entry(doc, method=None):
             )
         )
 
+    return destination_account, doc.party_name or doc.party
+
+
+def _create_transfer(doc, source_account, destination_account, beneficiary_name):
     # ---------------------------------------------------------
     # Load Bank Accounts
     # ---------------------------------------------------------
@@ -120,9 +167,10 @@ def create_bank_transfer_from_payment_entry(doc, method=None):
         source_account,
     )
 
-    destination = frappe.get_doc(
-        "Bank Account",
-        destination_account,
+    destination = (
+        frappe.get_doc("Bank Account", destination_account)
+        if destination_account
+        else frappe._dict()
     )
 
     # ---------------------------------------------------------
@@ -151,7 +199,7 @@ def create_bank_transfer_from_payment_entry(doc, method=None):
     description = (
         doc.remarks
         or _("Payment to {0}").format(
-            doc.party_name or doc.party
+            beneficiary_name
         )
     )
 
@@ -162,13 +210,15 @@ def create_bank_transfer_from_payment_entry(doc, method=None):
     transfer = create_from_reference(
         reference_doctype="Payment Entry",
         reference_name=doc.name,
+        payment_entry=doc.name,
 
         bank=bank,
 
         source_account=source.name,
-        destination_account=destination.name,
+        destination_account=destination.get("name"),
 
         transfer_type=transfer_type,
+        purpose_code=doc.get("custom_purpose_code"),
 
         amount=doc.paid_amount,
         currency=doc.paid_from_account_currency,
@@ -178,18 +228,22 @@ def create_bank_transfer_from_payment_entry(doc, method=None):
         sender_name=doc.company,
         sender_country_code="KE",
 
-        beneficiary_name=(
-            doc.party_name or doc.party
-        ),
+        beneficiary_name=beneficiary_name,
         beneficiary_country="KE",
 
         beneficiary_account_number=(
-            destination.bank_account_no
+            destination.get("bank_account_no")
         ),
 
         bank_code=(
-            destination.custom_bank_code
+            destination.get("custom_bank_code")
         ),
+        bank_bic=destination.get("bank") and frappe.db.get_value("Bank", destination.bank, "swift_number"),
+        destination_currency=doc.paid_from_account_currency
+        if doc.paid_from_account_currency in ("KES", "USD", "EUR", "GBP") else None,
+
+        beneficiary_mobile_number=doc.get("custom_beneficiary_mobile"),
+        wallet_name=doc.get("custom_mobile_network"),
     )
 
     return transfer.name

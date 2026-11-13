@@ -2,6 +2,8 @@
 # For license information, please see license.txt
 
 import frappe
+import time
+
 import requests
 
 from frappe import _
@@ -44,6 +46,10 @@ class StanbicClient:
     SORT_CODES_PATH = "/api/sandbox/fetch-sortcodes/"
     STATEMENTS_PATH = "/api/sandbox/fetchStatements/"
     TRANSACTIONS_PATH = "/api/sandbox/fetchTransactions/"
+    BALANCE_PATH = "/api/sandbox/balance/"
+    TRANSACTION_STATUS_PATH = "/api/sandbox/transaction-status-sandbox/"
+    REGISTER_URL_PATH = "/api/sandbox/registerurl/"
+    SWIFT_PATH = "/api/sandbox/swift-payments/"
     ZOHO_STATEMENTS_PATH = "/api/sandbox/statements/"
 
     # ------------------------------------------------------------------
@@ -159,22 +165,23 @@ class StanbicClient:
         """
         Return a valid Stanbic OAuth access token.
 
-        Reuses the stored token where possible and requests
+        Reuses the cached token where possible and requests
         a new token when expired or force_refresh=True.
+
+        Tokens are cached per API key: each bank account has its own key, and
+        a token issued for one account's key acts on that account only.
         """
 
         now = frappe.utils.now_datetime()
 
-        if (
-            not force_refresh
-            and self.credentials.access_token
-            and self.credentials.token_expiry
-            and self.credentials.token_expiry > now
-        ):
-            return self.credentials.access_token
-
         client_id = self.api_credentials["client_id"]
         client_secret = self.api_credentials["client_secret"]
+        cache_key = f"stanbic_token:{self.credentials.name}:{client_id}"
+
+        if not force_refresh:
+            cached = frappe.cache.get_value(cache_key)
+            if cached:
+                return cached
 
         token_url = (
             f"{self.base_url}"
@@ -259,20 +266,13 @@ class StanbicClient:
             as_datetime=True,
         )
 
-        frappe.db.set_value(
-            "Bank Integration Credentials",
-            self.credentials.name,
-            {
-                "access_token": access_token,
-                "token_expiry": token_expiry,
-            },
-            update_modified=False,
+        frappe.cache.set_value(
+            cache_key,
+            access_token,
+            expires_in_sec=int((token_expiry - now).total_seconds()),
         )
 
-        frappe.db.commit()
-
-        self.credentials.access_token = access_token
-        self.credentials.token_expiry = token_expiry
+        self.token_expiry = token_expiry
 
         return access_token
 
@@ -286,9 +286,14 @@ class StanbicClient:
         endpoint,
         payload=None,
         retry_on_401=True,
+        timeout=60,
+        attempts=1,
     ):
         """
         Make an authenticated Stanbic API request.
+
+        attempts > 1 retries on connection errors and 5xx responses. Only pass it
+        for read-only calls: retrying a payment that timed out could pay twice.
 
         Returns:
 
@@ -309,28 +314,46 @@ class StanbicClient:
 
         url = f"{self.base_url}{endpoint}"
 
-        try:
-            response = requests.request(
-                method,
-                url,
-                headers=headers,
-                json=payload,
-                timeout=60,
-            )
+        for attempt in range(1, attempts + 1):
+            try:
+                response = requests.request(
+                    method,
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=timeout,
+                )
 
-        except requests.exceptions.RequestException as e:
-            frappe.log_error(
-                title="Stanbic API Request Error",
-                message=(
-                    f"Method: {method}\n"
-                    f"URL: {url}\n"
-                    f"Error: {str(e)}"
-                ),
-            )
+            except requests.exceptions.RequestException as e:
+                if attempt < attempts:
+                    time.sleep(2)
+                    continue
 
-            frappe.throw(
-                f"Failed to connect to Stanbic: {str(e)}"
-            )
+                frappe.log_error(
+                    title="Stanbic API Request Error",
+                    message=(
+                        f"Method: {method}\n"
+                        f"URL: {url}\n"
+                        f"Attempts: {attempts}\n"
+                        f"Error: {str(e)}"
+                    ),
+                )
+
+                if attempts > 1:
+                    frappe.throw(_(
+                        "Stanbic is not responding right now (tried {0} times). "
+                        "This is on the bank's side; please try again in a few minutes."
+                    ).format(attempts))
+
+                frappe.throw(
+                    f"Failed to connect to Stanbic: {str(e)}"
+                )
+
+            # Stanbic's gateway returns 5xx when its own backend is unreachable.
+            if response.status_code < 500 or attempt == attempts:
+                break
+
+            time.sleep(2)
 
         # --------------------------------------------------------------
         # Retry once if token was rejected
@@ -492,9 +515,14 @@ class StanbicClient:
         Fetch account mini statement / last 20 transactions.
         """
 
-        return self.post(
+        # Stanbic's gateway waits ~60s on its backend before answering, so allow 75s.
+        # One attempt only: a retry would exceed the 120s web request limit.
+        return self.request(
+            "POST",
             self.TRANSACTIONS_PATH,
-            payload,
+            payload=payload,
+            timeout=75,
+            attempts=1,
         )
 
     def fetch_zoho_statements(self, payload):

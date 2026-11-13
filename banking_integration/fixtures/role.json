@@ -1,0 +1,11 @@
+[
+ {
+  "doctype": "Role",
+  "name": "Bank Transfer Approver",
+  "role_name": "Bank Transfer Approver",
+  "desk_access": 1,
+  "two_factor_auth": 0,
+  "disabled": 0,
+  "is_custom": 0
+ }
+]

@@ -1,8 +1,11 @@
 import frappe
 from frappe import _
-from frappe.utils import getdate
+from datetime import datetime
+
+from frappe.utils import flt, getdate
 
 from banking_integration.clients.jenga import JengaClient
+from banking_integration.clients.ncba import NCBAClient
 from banking_integration.clients.stanbic import StanbicClient
 from banking_integration.services.providers import get_bank_account_credentials
 
@@ -148,6 +151,12 @@ def sync_stanbic_statement(account, date_from, date_to):
 
     data = response.get("data", {}) if response else {}
 
+    if response and response.get("status_code", 0) >= 500:
+        frappe.throw(
+            "Stanbic's server is not responding right now. "
+            "This is on the bank's side; please try again in a few minutes."
+        )
+
     if not response or not response.get("success"):
         frappe.throw(
             (data.get("moreInformation") if isinstance(data, dict) else None)
@@ -277,3 +286,184 @@ def _parse_datetime(value):
         return frappe.utils.get_datetime(value)
     except Exception:
         return None
+
+
+def sync_ncba_statement(account, date_from, date_to):
+    """Import an NCBA account statement into Bank Transactions."""
+    bank_account = frappe.get_doc("Bank Account", account)
+
+    if not bank_account.bank_account_no:
+        frappe.throw(_("Bank Account {0} has no account number.").format(account))
+
+    client = NCBAClient(get_bank_account_credentials(bank_account))
+
+    data = client.account_statement(
+        bank_account.bank_account_no,
+        getdate(date_from).strftime("%d%m%Y"),
+        getdate(date_to).strftime("%d%m%Y"),
+    )
+
+    if data.get("ErrorCode") != "000":
+        frappe.throw(
+            _("NCBA statement error {0}: {1}").format(
+                data.get("ErrorCode"), data.get("ErrorMessage")
+            )
+        )
+
+    transactions = data.get("AccountList") or []
+    created = skipped = failed = 0
+
+    for tx in transactions:
+        # One NCBA transaction has several legs (amount, charge, excise duty);
+        # the leg number is the unique key.
+        tx_id = tx.get("UniqueTransactionLegNo")
+        deposit = flt(tx.get("CreditAmount"))
+        withdrawal = flt(tx.get("DebitAmount"))
+
+        if not tx_id or not tx.get("ValueDate") or not (deposit or withdrawal):
+            skipped += 1
+            continue
+
+        if frappe.db.exists(
+            "Bank Transaction", {"bank_account": bank_account.name, "transaction_id": tx_id}
+        ):
+            skipped += 1
+            continue
+
+        try:
+            bank_transaction = frappe.new_doc("Bank Transaction")
+            bank_transaction.update({
+                "date": datetime.strptime(tx["ValueDate"], "%d%m%Y").date(),
+                "bank_account": bank_account.name,
+                "company": bank_account.company,
+                "deposit": deposit,
+                "withdrawal": withdrawal,
+                "currency": tx.get("TransactionCurrency") or data.get("Currency"),
+                "description": " | ".join(
+                    filter(None, (
+                        (tx.get("Narrative") or "").strip(),
+                        (tx.get("PaymentDetails") or "").strip(),
+                    ))
+                ),
+                "reference_number": tx.get("InstrumentReferenceNumber") or tx_id,
+                "transaction_id": tx_id,
+                "status": "Unreconciled",
+            })
+            bank_transaction.insert(ignore_permissions=True)
+            bank_transaction.submit()
+            created += 1
+
+        except Exception:
+            failed += 1
+            frappe.log_error(
+                frappe.get_traceback(), f"NCBA Bank Transaction Import Failed: {tx_id}"
+            )
+
+    frappe.db.commit()
+
+    return {
+        "status": "success",
+        "account": bank_account.bank_account_no,
+        "transactions": len(transactions),
+        "created": created,
+        "skipped": skipped,
+        "failed": failed,
+        "balance": data.get("AvailableBalance"),
+        "currency": data.get("Currency"),
+    }
+
+
+STANBIC_STATEMENT_LIMIT = 500
+
+
+def stanbic_transaction_id(reference, signed_amount):
+    """One id per statement line, shared by the online statement and IPN alerts.
+
+    A payment and its fee share one T24 reference (FT...), as do month-end charges, so the
+    reference alone is not unique. shortcut: two lines with the same reference AND the same
+    signed amount would collide; revisit if Stanbic exposes a per-line id.
+    """
+    if not reference or isinstance(reference, dict):
+        return None
+    return f"{str(reference).strip()}/{flt(signed_amount):.2f}"
+
+
+def sync_stanbic_online_statement(account, date_from, date_to):
+    """Import Stanbic's Online Account Statement (fetchStatements) for a date range."""
+    bank_account = frappe.get_doc("Bank Account", account)
+    if not date_from or not date_to:
+        frappe.throw("From Date and To Date are required for the online statement.")
+
+    client = StanbicClient(
+        credentials=get_bank_account_credentials(bank_account),
+        bank_account=bank_account.name,
+    )
+    # No account number in the request: Stanbic picks the account from the API key.
+    response = client.request(
+        "POST",
+        client.STATEMENTS_PATH,
+        payload={
+            "FromDate": getdate(date_from).strftime("%Y%m%d"),
+            "ToDate": getdate(date_to).strftime("%Y%m%d"),
+            "NoOfTxns": str(STANBIC_STATEMENT_LIMIT),
+        },
+        timeout=75,
+    )
+    data = response.get("data") if isinstance(response.get("data"), dict) else {}
+
+    if not response.get("success") or data.get("ResponseCode") not in (None, "00"):
+        frappe.throw(
+            f"Stanbic online statement error (HTTP {response.get('status_code')}): "
+            f"{data.get('ResponseMessage') or data.get('moreInformation') or data.get('errorMessage') or data}"
+        )
+
+    # The live API returns "TransactionHistory"; the spec documents "transaction-items".
+    transactions = data.get("TransactionHistory") or data.get("transaction-items") or []
+    created = skipped = 0
+    # Stanbic ignores FromDate and returns the latest NoOfTxns lines, so filter here.
+    start, end = getdate(date_from), getdate(date_to)
+    in_range = [
+        tx for tx in transactions
+        if tx.get("TransactionDate") and start <= datetime.strptime(tx["TransactionDate"], "%Y%m%d").date() <= end
+    ]
+    # Hitting the cap while every line is still inside the range means older lines were cut off.
+    truncated = len(transactions) >= STANBIC_STATEMENT_LIMIT and len(in_range) == len(transactions)
+
+    for tx in in_range:
+        signed = flt(str(tx.get("TxnAmount") or "0").replace(",", ""))
+        tx_id = stanbic_transaction_id(tx.get("T24UniqRef"), signed)
+        if not tx_id or not signed or not tx.get("TransactionDate"):
+            skipped += 1
+            continue
+        if frappe.db.exists("Bank Transaction", {"bank_account": bank_account.name, "transaction_id": tx_id}):
+            skipped += 1
+            continue
+
+        amount = abs(signed)
+        is_credit = signed > 0  # debits come back negative
+        bt = frappe.get_doc({
+            "doctype": "Bank Transaction",
+            "date": datetime.strptime(tx["TransactionDate"], "%Y%m%d").date(),
+            "bank_account": bank_account.name,
+            "company": bank_account.company,
+            "deposit": amount if is_credit else 0,
+            "withdrawal": 0 if is_credit else amount,
+            "currency": tx.get("TxnCurrency") or "KES",
+            "description": tx.get("TxnDescr") or tx.get("TransactionType") or "",
+            "reference_number": tx_id,
+            "transaction_id": tx_id,
+        })
+        bt.insert(ignore_permissions=True)
+        bt.submit()
+        created += 1
+
+    frappe.db.commit()
+    return {
+        "status": "success",
+        "account": bank_account.bank_account_no,
+        "transactions": len(in_range),
+        "created": created,
+        "skipped": skipped,
+        **({"message": f"Stanbic returned its maximum of {STANBIC_STATEMENT_LIMIT} lines, so the "
+            "start of this range may be missing. Use a shorter date range."} if truncated else {}),
+    }

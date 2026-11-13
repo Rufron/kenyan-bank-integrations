@@ -16,6 +16,7 @@
   "destination_account",
   "transfer_details_section",
   "transfer_type",
+  "purpose_code",
   "amount",
   "currency",
   "description",
@@ -115,6 +116,13 @@
    "label": "Transfer Type",
    "options": "Internal Bank Transfer\nEFT\nRTGS\nPesalink Bank\nPesalink Mobile\nSWIFT\nMobile Wallet",
    "reqd": 1
+  },
+  {
+   "fieldname": "purpose_code",
+   "fieldtype": "Data",
+   "label": "Purpose Code",
+   "depends_on": "eval:doc.transfer_type=='RTGS'",
+   "description": "CBK Purpose of Payment code (required by NCBA for RTGS)"
   },
   {
    "fieldname": "amount",
@@ -347,7 +355,7 @@
  ],
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2026-08-26 09:22:24.190831",
+ "modified": "2026-11-12 09:21:48.807930",
  "modified_by": "Administrator",
  "module": "Banking Integration",
  "name": "Bank Transfer",
@@ -364,6 +372,12 @@
    "role": "System Manager",
    "share": 1,
    "write": 1
+  },
+  {
+   "read": 1,
+   "report": 1,
+   "print": 1,
+   "role": "Bank Transfer Approver"
   }
  ],
  "row_format": "Dynamic",

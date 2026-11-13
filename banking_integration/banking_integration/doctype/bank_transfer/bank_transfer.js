@@ -12,39 +12,144 @@ frappe.ui.form.on("Bank Transfer", {
             frm.disable_save();
         }
 
-        // Only allow sending an existing transfer.
+        // Second-person approval: an approver who didn't make the payment sends it.
         if (
             !is_new &&
-            ["Draft", "Pending Approval"].includes(frm.doc.status)
+            ["Draft", "Pending Approval", "Failed"].includes(frm.doc.status)
+            && frappe.user.has_role("Bank Transfer Approver")
+            && frm.doc.owner !== frappe.session.user
         ) {
             frm.add_custom_button(
-                __("Send Transfer"),
+                __("Approve & Send"),
                 () => {
                     confirm_and_send_transfer(frm);
                 }
             );
         }
+
+        if (!is_new && frm.doc.transaction_reference && (frm.doc.bank || "").toLowerCase().includes("stanbic")) {
+            frm.add_custom_button(__("Check Status with Stanbic"), () => {
+                frappe.call({
+                    method: "banking_integration.api.stanbic.check_transfer_status",
+                    args: { bank_transfer: frm.doc.name },
+                    freeze: true,
+                    freeze_message: __("Asking Stanbic..."),
+                    callback(r) {
+                        const s = r.message || {};
+                        const esc = frappe.utils.escape_html;
+                        frappe.msgprint({
+                            title: __("Stanbic Transaction Status"),
+                            indicator: s.bank_status === "PROCESSED" ? "green" : "orange",
+                            message: `
+                                <p><strong>${__("Stanbic says")}:</strong> ${esc(s.bank_status || "-")} ${esc(s.reason || "")} (HTTP ${esc(String(s.http || ""))})</p>
+                                <p><strong>${__("Bank reference")}:</strong> ${esc(s.bank_reference || "-")}</p>
+                                <p><strong>${__("Transfer status")}:</strong> ${esc(s.status || "")}</p>`,
+                        });
+                        frm.reload_doc();
+                    },
+                });
+            });
+        }
+
+        if (
+            !is_new
+            && frm.doc.transaction_reference
+            && (frm.doc.bank || "").toUpperCase().startsWith("NCBA")
+        ) {
+            frm.add_custom_button(__("Check Status with NCBA"), () => {
+                frappe.call({
+                    method: "banking_integration.api.ncba.check_transfer_status",
+                    args: { bank_transfer: frm.doc.name },
+                    freeze: true,
+                    freeze_message: __("Asking NCBA..."),
+                    callback(r) {
+                        const s = r.message || {};
+                        frappe.msgprint({
+                            title: __("NCBA Transaction Status"),
+                            indicator: s.code === "000" ? "green" : "orange",
+                            message: `
+                                <p><strong>${__("NCBA says")}:</strong> ${frappe.utils.escape_html(s.message || "")} (${frappe.utils.escape_html(s.code || "")})</p>
+                                <p><strong>${__("Core reference")}:</strong> ${frappe.utils.escape_html(s.core_reference || "-")}</p>
+                                <p><strong>${__("Transfer status")}:</strong> ${frappe.utils.escape_html(s.status || "")}</p>`,
+                        });
+                        frm.reload_doc();
+                    },
+                });
+            });
+        }
     },
 });
 
 
+const BT_METHOD = "banking_integration.banking_integration.doctype.bank_transfer.bank_transfer.";
+
 function confirm_and_send_transfer(frm) {
+    frappe.call(BT_METHOD + "authenticator_is_set_up").then(r => {
+        r.message ? show_approve_dialog(frm) : setup_authenticator(frm);
+    });
+}
+
+
+// One-time: link the approver's authenticator app, then continue to approval.
+function setup_authenticator(frm) {
+    frappe.prompt(
+        { fieldname: "password", fieldtype: "Password", label: __("Your ERPNext password"), reqd: 1 },
+        ({ password }) => {
+            frappe.call(BT_METHOD + "start_authenticator_setup", { password }).then(r => {
+                const dialog = new frappe.ui.Dialog({
+                    title: __("Link your authenticator app"),
+                    fields: [
+                        {
+                            fieldtype: "HTML",
+                            options: `<p>${__("In Google Authenticator tap +, Scan a QR code, and scan this:")}</p>
+                                <p style="text-align:center"><img src="data:image/svg+xml;base64,${r.message}"></p>`,
+                        },
+                        { fieldname: "otp", fieldtype: "Data", label: __("Code now shown in the app"), reqd: 1 },
+                    ],
+                    primary_action_label: __("Confirm"),
+                    primary_action({ otp }) {
+                        frappe.call(BT_METHOD + "finish_authenticator_setup", { otp }).then(() => {
+                            dialog.hide();
+                            frappe.show_alert({ message: __("Authenticator linked"), indicator: "green" });
+                            show_approve_dialog(frm);
+                        });
+                    },
+                });
+                dialog.show();
+            });
+        },
+        __("Set up approval codes"),
+        __("Continue")
+    );
+}
+
+
+function show_approve_dialog(frm) {
+    const d = frm.doc;
+    const esc = frappe.utils.escape_html;
     const dialog = new frappe.ui.Dialog({
-        title: __("Confirm Your Identity"),
+        title: __("Approve Bank Transfer"),
 
         fields: [
             {
-                fieldname: "password",
-                fieldtype: "Password",
-                label: __(
-                    "Enter your ERPNext password to authorize this transfer"
-                ),
+                fieldtype: "HTML",
+                options: `
+                    <p><strong>${__("Amount")}:</strong> ${format_currency(d.amount, d.currency)}</p>
+                    <p><strong>${__("To")}:</strong> ${esc(d.beneficiary_name || "")}</p>
+                    <p><strong>${__("Account")}:</strong> ${esc(d.beneficiary_account_number || "")} (${esc(d.destination_account || "")})</p>
+                    <p><strong>${__("From")}:</strong> ${esc(d.source_account || "")}</p>
+                    <p><strong>${__("Method")}:</strong> ${esc(d.transfer_type || "")}</p>`,
+            },
+            {
+                fieldname: "otp",
+                fieldtype: "Data",
+                label: __("6-digit code from your authenticator app"),
                 reqd: 1,
             },
         ],
 
         primary_action_label: __(
-            "Send Transfer"
+            "Approve & Send"
         ),
 
         primary_action(values) {
@@ -58,8 +163,8 @@ function confirm_and_send_transfer(frm) {
                     bank_transfer:
                         frm.doc.name,
 
-                    password:
-                        values.password,
+                    otp: values.otp,
+                    modified: frm.doc.modified,
                 },
 
                 freeze: true,
