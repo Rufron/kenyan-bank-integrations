@@ -12,12 +12,11 @@ frappe.ui.form.on("Bank Transfer", {
             frm.disable_save();
         }
 
-        // Second-person approval: an approver who didn't make the payment sends it.
+        // Only a Bank Transfer Approver can send it.
         if (
             !is_new &&
             ["Draft", "Pending Approval", "Failed"].includes(frm.doc.status)
             && frappe.user.has_role("Bank Transfer Approver")
-            && frm.doc.owner !== frappe.session.user
         ) {
             frm.add_custom_button(
                 __("Approve & Send"),

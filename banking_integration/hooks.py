@@ -14,6 +14,7 @@ doctype_js = {
 
 doctype_list_js = {
     "Bank Transaction": "public/js/bank_transaction_list.js",
+    "Bank Transfer": "public/js/bank_transfer_list.js",
 }
 
 extend_doctype_class = {

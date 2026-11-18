@@ -401,8 +401,8 @@ def approve_and_send(
     modified: str,
 ):
     """
-    Second-person approval: a Bank Transfer Approver (not the person who
-    made the payment) confirms with an authenticator code, then it is sent.
+    A Bank Transfer Approver (who may also have made the payment) confirms
+    with an authenticator code, then it is sent.
     """
 
     user = frappe.session.user
@@ -412,17 +412,6 @@ def approve_and_send(
         "Bank Transfer",
         bank_transfer,
     )
-
-    # The transfer is created when the payment is submitted, so its owner is the maker.
-    makers = {
-        doc.owner,
-        frappe.db.get_value(doc.reference_doctype, doc.reference_name, "owner"),
-    }
-    if user in makers:
-        frappe.throw(
-            _("You created this payment, so someone else must approve it."),
-            frappe.PermissionError,
-        )
 
     # Bind the approval to exactly what the approver saw (amount, beneficiary...).
     if str(doc.modified) != modified:
