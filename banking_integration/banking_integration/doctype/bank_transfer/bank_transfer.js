@@ -89,37 +89,49 @@ function confirm_and_send_transfer(frm) {
 }
 
 
-// One-time: link the approver's authenticator app, then continue to approval.
+// One-time: password, then a code emailed to the approver, then link the authenticator app.
 function setup_authenticator(frm) {
     frappe.prompt(
         { fieldname: "password", fieldtype: "Password", label: __("Your ERPNext password"), reqd: 1 },
-        ({ password }) => {
-            frappe.call(BT_METHOD + "start_authenticator_setup", { password }).then(r => {
-                const dialog = new frappe.ui.Dialog({
-                    title: __("Link your authenticator app"),
-                    fields: [
-                        {
-                            fieldtype: "HTML",
-                            options: `<p>${__("In Google Authenticator tap +, Scan a QR code, and scan this:")}</p>
-                                <p style="text-align:center"><img src="data:image/svg+xml;base64,${r.message}"></p>`,
-                        },
-                        { fieldname: "otp", fieldtype: "Data", label: __("Code now shown in the app"), reqd: 1 },
-                    ],
-                    primary_action_label: __("Confirm"),
-                    primary_action({ otp }) {
-                        frappe.call(BT_METHOD + "finish_authenticator_setup", { otp }).then(() => {
-                            dialog.hide();
-                            frappe.show_alert({ message: __("Authenticator linked"), indicator: "green" });
-                            show_approve_dialog(frm);
-                        });
-                    },
-                });
-                dialog.show();
-            });
-        },
+        ({ password }) => frappe.call({
+            method: BT_METHOD + "send_setup_email_code", args: { password },
+            freeze: true, freeze_message: __("Emailing you a code..."),
+        }).then(() => frappe.prompt(
+            { fieldname: "email_code", fieldtype: "Data", label: __("Code we just emailed you"), reqd: 1 },
+            ({ email_code }) => show_authenticator_qr(frm, email_code),
+            __("Check your email"),
+            __("Continue")
+        )),
         __("Set up approval codes"),
         __("Continue")
     );
+}
+
+
+function show_authenticator_qr(frm, email_code) {
+    frappe.call(BT_METHOD + "start_authenticator_setup", { email_code }).then(r => {
+        const dialog = new frappe.ui.Dialog({
+            title: __("Link your authenticator app"),
+            fields: [
+                {
+                    fieldtype: "HTML",
+                    options: `<p>${__("In Google Authenticator tap +, Scan a QR code, and scan this:")}</p>
+                        <p style="text-align:center"><img src="data:image/svg+xml;base64,${r.message}"></p>
+                        <p class="text-muted small">${__("Make sure nobody else can see your screen. This code works for 10 minutes, only on this attempt.")}</p>`,
+                },
+                { fieldname: "otp", fieldtype: "Data", label: __("Code now shown in the app"), reqd: 1 },
+            ],
+            primary_action_label: __("Confirm"),
+            primary_action({ otp }) {
+                frappe.call(BT_METHOD + "finish_authenticator_setup", { otp }).then(() => {
+                    dialog.hide();
+                    frappe.show_alert({ message: __("Authenticator linked"), indicator: "green" });
+                    show_approve_dialog(frm);
+                });
+            },
+        });
+        dialog.show();
+    });
 }
 
 

@@ -1,10 +1,14 @@
 # Copyright (c) 2026, Nathan Wagacha and contributors
 # For license information, please see license.txt
 
+import hmac
+import secrets
+
 import frappe
 import pyotp
 from frappe import _
 from frappe.model.document import Document
+from frappe.rate_limiter import rate_limit
 
 
 _EQUITY_TYPES = {
@@ -307,7 +311,7 @@ def create_from_reference(
 
 
 APPROVER_ROLE = "Bank Transfer Approver"
-MAX_OTP_FAILURES = 3
+MAX_OTP_FAILURES = 4
 OTP_LOCKOUT_SECONDS = 600
 
 
@@ -319,62 +323,120 @@ def _only_approvers():
         )
 
 
-@frappe.whitelist()
-def authenticator_is_set_up():
-    from frappe.twofactor import get_default
-
-    _only_approvers()
-    return bool(get_default(frappe.session.user + "_otplogin"))
+# The approval secret is separate from Frappe's login 2FA secret and kept encrypted (in __Auth).
+SECRET_FIELD = "bank_transfer_otp_secret"
+SETUP_TTL = 600
 
 
-@frappe.whitelist()
-def start_authenticator_setup(password: str):
-    """Return a QR code linking the approver's phone. Re-linking needs a reset (User > Reset OTP Secret)."""
-    from frappe.twofactor import get_default, get_otpsecret_for_, get_qr_svg_code
-    from frappe.utils.password import check_password
+def _linked_secret(user):
+    from frappe.utils.password import get_decrypted_password
 
+    return get_decrypted_password("User", user, SECRET_FIELD, raise_exception=False)
+
+
+def _setup_not_linked():
     _only_approvers()
     user = frappe.session.user
-    if get_default(user + "_otplogin"):
+    if _linked_secret(user):
         frappe.throw(_("Your authenticator is already set up. Ask a System Manager to reset it if you lost your phone."))
+    return user
 
+
+@frappe.whitelist()
+def authenticator_is_set_up():
+    _only_approvers()
+    return bool(_linked_secret(frappe.session.user))
+
+
+@frappe.whitelist()
+@rate_limit(limit=5, seconds=SETUP_TTL)
+def send_setup_email_code(password: str):
+    """Setup step 1: password, then a one-time code goes to the approver's own inbox."""
+    from frappe.utils.password import check_password
+
+    user = _setup_not_linked()
     check_password(user, password)
+    code = f"{secrets.randbelow(10**6):06d}"
+    frappe.cache.set_value(f"bank_transfer_setup_email_code:{user}", code, expires_in_sec=SETUP_TTL)
+    frappe.sendmail(
+        recipients=[frappe.db.get_value("User", user, "email")],
+        subject=_("Your bank transfer authenticator setup code"),
+        message=_("Your code is <b>{0}</b>. It expires in 10 minutes. If you did not start this, tell a System Manager.").format(code),
+        # Queued, not now=True: an SMTP failure after commit would 500 the request and hide the code prompt.
+    )
+    return True
+
+
+@frappe.whitelist()
+def start_authenticator_setup(email_code: str):
+    """Setup step 2: the emailed code unlocks a QR with a brand-new secret, valid for 10 minutes."""
+    from frappe.twofactor import get_qr_svg_code
+
+    user = _setup_not_linked()
+    key = f"bank_transfer_setup_email_code:{user}"
+    expected = frappe.cache.get_value(key)
+    # One guess per emailed code, so it can't be brute-forced.
+    frappe.cache.delete_value(key)
+    if not expected or not hmac.compare_digest(str(expected), (email_code or "").strip()):
+        frappe.throw(_("Wrong or expired email code. Start again to get a new one."), frappe.PermissionError)
+
+    # A fresh secret each time: a QR seen or scanned in an earlier attempt stops working.
+    secret = pyotp.random_base32()
+    frappe.cache.set_value(f"bank_transfer_setup_secret:{user}", secret, expires_in_sec=SETUP_TTL)
     issuer = frappe.db.get_single_value("System Settings", "otp_issuer_name") or "ERPNext"
-    uri = pyotp.TOTP(get_otpsecret_for_(user)).provisioning_uri(name=user, issuer_name=issuer)
+    uri = pyotp.TOTP(secret).provisioning_uri(name=user, issuer_name=f"{issuer} Bank Transfers")
     return get_qr_svg_code(uri).decode()
 
 
 @frappe.whitelist()
 def finish_authenticator_setup(otp: str):
-    """The first correct code proves the phone scanned the QR; mark the setup complete."""
-    from frappe.twofactor import get_default, set_default
+    """Setup step 3: the first correct code proves the phone scanned the QR; save the secret."""
+    from frappe.utils.password import set_encrypted_password
 
     _only_approvers()
     user = frappe.session.user
-    if get_default(user + "_otplogin"):
+    if _linked_secret(user):
         return True
-    if not get_default(user + "_otpsecret"):
-        frappe.throw(_("Start the setup again: click Approve & Send."))
+    key = f"bank_transfer_setup_secret:{user}"
+    secret = frappe.cache.get_value(key)
+    if not secret:
+        frappe.throw(_("The setup expired. Click Approve & Send to start again."))
 
     # Not single-use: the approver may type the same code straight into the approval.
-    _check_code(user, otp, single_use=False)
-    set_default(user + "_otplogin", 1)
+    _check_code(user, otp, secret, single_use=False)
+    set_encrypted_password("User", user, secret, SECRET_FIELD)
+    frappe.cache.delete_value(key)
+    _alert_authenticator_change(user, _("linked to a phone"))
     return True
 
 
-def verify_approver_otp(user, otp):
-    """Check a code from the approver's authenticator app (Frappe's per-user OTP secret)."""
-    from frappe.twofactor import get_default
+def _alert_authenticator_change(user, what):
+    """Tell the approver and System Managers, so an unexpected link or reset gets noticed."""
+    from frappe.utils.user import get_system_managers
 
-    if not get_default(user + "_otplogin"):
+    message = _(
+        "The bank transfer approval authenticator for {0} was {1} by {2} at {3}. "
+        "If this was not expected, have a System Manager reset it immediately."
+    ).format(user, what, frappe.session.user, frappe.utils.now_datetime().strftime("%Y-%m-%d %H:%M"))
+    frappe.get_doc("User", user).add_comment("Info", message)
+    recipients = {frappe.db.get_value("User", user, "email"), *get_system_managers(only_name=True)}
+    frappe.sendmail(
+        recipients=[r for r in recipients if r and r not in ("Administrator", "admin@example.com")],
+        subject=_("Bank transfer authenticator {0}: {1}").format(what, user),
+        message=message,
+    )
+
+
+def verify_approver_otp(user, otp):
+    """Check a code from the approver's linked authenticator app."""
+    secret = _linked_secret(user)
+    if not secret:
         frappe.throw(_("Set up your authenticator app first: click Approve & Send and follow the steps."))
 
-    _check_code(user, otp)
+    _check_code(user, otp, secret)
 
 
-def _check_code(user, otp, single_use=True):
-    from frappe.twofactor import get_otpsecret_for_
-
+def _check_code(user, otp, secret, single_use=True):
     fail_key = f"bank_transfer_otp_failures:{user}"
     failures = frappe.cache.get_value(fail_key) or 0
     if failures >= MAX_OTP_FAILURES:
@@ -383,9 +445,7 @@ def _check_code(user, otp, single_use=True):
     # A code stays valid for ~30-90s; refuse a second use so a seen code can't be replayed.
     otp = (otp or "").strip()
     used_key = f"bank_transfer_otp_used:{user}:{otp}"
-    if not otp.isdigit() or frappe.cache.get_value(used_key) or not pyotp.TOTP(
-        get_otpsecret_for_(user)
-    ).verify(otp, valid_window=1):
+    if not otp.isdigit() or frappe.cache.get_value(used_key) or not pyotp.TOTP(secret).verify(otp, valid_window=1):
         frappe.cache.set_value(fail_key, failures + 1, expires_in_sec=OTP_LOCKOUT_SECONDS)
         frappe.throw(_("Incorrect or already used verification code."), frappe.PermissionError)
 
@@ -453,11 +513,9 @@ def approve_and_send(
 @frappe.whitelist()
 def reset_approver_authenticator(user: str):
     """System Manager clears an approver's linked phone; they re-link on their next Approve & Send."""
-    from frappe.twofactor import clear_default
+    from frappe.utils.password import remove_encrypted_password
 
     frappe.only_for("System Manager")
-    clear_default(user + "_otplogin")
-    clear_default(user + "_otpsecret")
-    frappe.get_doc("User", user).add_comment(
-        "Info", _("Bank transfer approval authenticator reset by {0}").format(frappe.session.user)
-    )
+    remove_encrypted_password("User", user, SECRET_FIELD)
+    frappe.cache.delete_value(f"bank_transfer_setup_secret:{user}")
+    _alert_authenticator_change(user, _("reset"))
