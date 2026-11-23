@@ -31,6 +31,7 @@ def test_connection(account: str):
 
 @frappe.whitelist()
 def get_account_balance(account: str):
+    frappe.only_for("Bank Transfer Approver")
     return refresh_balance(account)
 
 

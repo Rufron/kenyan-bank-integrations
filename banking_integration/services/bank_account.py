@@ -92,6 +92,7 @@ def _refresh_ncba_balance(doc):
 
 @frappe.whitelist()
 def refresh_balance(bank_account):
+    frappe.only_for("Bank Transfer Approver")
     doc = frappe.get_doc("Bank Account", bank_account)
 
     if not doc.bank_account_no:

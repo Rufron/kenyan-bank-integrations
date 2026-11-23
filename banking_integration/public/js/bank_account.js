@@ -1,6 +1,6 @@
 frappe.ui.form.on("Bank Account", {
     refresh(frm) {
-        if (!frm.is_new()) {
+        if (!frm.is_new() && frappe.user.has_role("Bank Transfer Approver")) {
             frm.add_custom_button(__("Refresh Balance"), () => {
                 frappe.call({
                     method: "banking_integration.services.bank_account.refresh_balance",
