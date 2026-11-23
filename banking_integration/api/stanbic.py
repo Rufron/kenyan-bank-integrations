@@ -1,3 +1,4 @@
+import hmac
 import re
 from datetime import datetime
 from urllib.parse import quote
@@ -30,50 +31,99 @@ def _parse_amount(text):
     return flt(str(text or "").replace(",", "").split()[-1]) if text else 0
 
 
+def _company_account_by_number(account_no):
+    """Stanbic sends 0100007743666 where ERPNext may hold 100007743666, so ignore leading zeros."""
+    number = str(account_no or "").strip().lstrip("0")
+    if not number:
+        return None
+    for acct in frappe.get_all(
+        "Bank Account",
+        filters={"bank_account_no": ["like", f"%{number}"], "is_company_account": 1, "disabled": 0},
+        fields=["name", "bank_account_no"],
+    ):
+        if (acct.bank_account_no or "").strip().lstrip("0") == number:
+            return acct.name
+    return None
+
+
+def _ipn_authentic(payload):
+    """Stanbic sends back the ApiKey/ApiSecret configured for the callback; compare with site config.
+
+    shortcut: secureHash isn't verified (Stanbic hasn't shared its recipe); add it once they do.
+    """
+    key, secret = frappe.conf.get("stanbic_ipn_api_key"), frappe.conf.get("stanbic_ipn_api_secret")
+    if not key or not secret:
+        return False
+    return hmac.compare_digest(str(payload.get("ApiKey") or ""), key) and hmac.compare_digest(
+        str(payload.get("ApiSecret") or ""), secret
+    )
+
+
+def _log_ipn(payload, processed, error=None):
+    """One Bank Callback Log per notification, whatever the outcome (credentials stripped)."""
+    try:
+        frappe.get_doc({
+            "doctype": "Bank Callback Log",
+            "callback_type": "Stanbic IPN",
+            "transaction_reference": payload.get("TransID"),
+            "retrieval_reference": payload.get("BusinessAccountNo"),
+            "payload": frappe.as_json({k: v for k, v in payload.items() if k not in ("ApiKey", "ApiSecret")}),
+            "headers": frappe.as_json({"method": frappe.request.method}),
+            "processed": 1 if processed else 0,
+            "processing_error": error,
+        }).insert(ignore_permissions=True)
+        frappe.db.commit()
+    except Exception:
+        frappe.log_error(title="Failed to create Bank Callback Log", message=frappe.get_traceback())
+
+
 @frappe.whitelist(allow_guest=True)
 def ipn():
-    """Stanbic transaction notification (register with register_notifications). Creates a Bank Transaction."""
+    """Stanbic transaction notification. Creates a Bank Transaction on the account it names."""
     ok = {"Result": {"ResultCode": "0", "ResultDesc": "Accepted"}}
     payload = frappe.request.get_json(silent=True) or frappe.request.form.to_dict() or {}
-    letter = payload.get("Letter") or payload
 
     try:
-        bank_account = frappe.db.get_value(
-            "Bank Account", {"bank_account_no": letter.get("AccountNo"), "is_company_account": 1}, "name"
-        )
-        # Guest endpoint: only trust a notification carrying the API key of the account it names.
-        if not bank_account or letter.get("ApiKey") != _client(bank_account).api_credentials["client_id"]:
-            frappe.log_error(title="Stanbic IPN rejected", message=frappe.as_json(
-                {"AccountNo": letter.get("AccountNo"), "reason": "unknown account or API key mismatch"}))
+        account_no = payload.get("BusinessAccountNo")
+        bank_account = _company_account_by_number(account_no)
+        if not bank_account or not _ipn_authentic(payload):
+            _log_ipn(payload, False, "Rejected: " + (
+                "API key/secret mismatch or not configured" if bank_account
+                else f"no company Bank Account with number {account_no!r}"))
             return json_response({"Result": {"ResultCode": "1", "ResultDesc": "Rejected"}}, status=403)
 
-        amount = _parse_amount(letter.get("TxnAmount"))
-        is_credit = (letter.get("ActionType") or "").upper() == "CREDIT"
-        # "FT20070YCTF8999\BNK" -> "FT20070YCTF8999"; same id scheme as the online statement.
-        tx_id = stanbic_transaction_id(
-            (letter.get("OurTxnReference") or "").split("\\")[0], amount if is_credit else -amount
-        )
+        amount = _parse_amount(payload.get("TransAmount"))
+        # No credit/debit flag: money left our account only when it is the DebitAccount.
+        is_credit = str(payload.get("DebitAccount") or "").lstrip("0") != str(account_no).lstrip("0")
+        tx_id = stanbic_transaction_id(payload.get("TransID"), amount if is_credit else -amount)
         if not tx_id or frappe.db.exists("Bank Transaction", {"bank_account": bank_account, "transaction_id": tx_id}):
+            _log_ipn(payload, True, "Duplicate: already recorded" if tx_id else "No TransID, nothing recorded")
             return json_response(ok)
 
+        # "18/11/2026 at 10:48AM" -> 2026-11-18
+        when = str(payload.get("TransTime") or "").split()
+        details = str(payload.get("PaymentDetails") or payload.get("InvoiceNumber") or "")
         bt = frappe.get_doc({
             "doctype": "Bank Transaction",
-            "date": datetime.strptime(letter["ValueDate"], "%d/%m/%Y").date() if letter.get("ValueDate") else frappe.utils.today(),
+            "date": datetime.strptime(when[0], "%d/%m/%Y").date() if when else frappe.utils.today(),
             "bank_account": bank_account,
             "deposit": amount if is_credit else 0,
             "withdrawal": 0 if is_credit else amount,
-            "currency": str(letter.get("TxnAmount") or "KES").split()[0],
-            "description": " ".join(str(letter.get("Narrative") or letter.get("TxnDescr") or "").replace("\\", " ").split()),
-            "reference_number": letter.get("ThirdPartyRef") or tx_id,
+            "currency": str(payload.get("TransAmount") or "KES").split()[0],
+            "description": " | ".join(x.strip() for x in details.replace("\\n", "\n").splitlines() if x.strip()),
+            "reference_number": payload.get("TransID"),
             "transaction_id": tx_id,
         })
         bt.insert(ignore_permissions=True)
         bt.submit()
         frappe.db.commit()
+        _log_ipn(payload, True)
         return json_response(ok)
 
     except Exception:
-        frappe.log_error(title="Stanbic IPN Error", message=frappe.get_traceback() + "\n" + frappe.as_json(payload))
+        frappe.db.rollback()
+        frappe.log_error(title="Stanbic IPN Error", message=frappe.get_traceback())
+        _log_ipn(payload, False, "Error: " + frappe.get_traceback().strip().splitlines()[-1][:130])
         return json_response({"Result": {"ResultCode": "1", "ResultDesc": "Error"}}, status=500)
 
 
