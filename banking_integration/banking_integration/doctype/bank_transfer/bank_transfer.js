@@ -115,7 +115,11 @@ function show_authenticator_qr(frm, email_code) {
             fields: [
                 {
                     fieldtype: "HTML",
-                    options: `<p>${__("In Google Authenticator tap +, Scan a QR code, and scan this:")}</p>
+                    options: `<p>${__("Scan this with your authenticator app:")}</p>
+                        <ul class="small">
+                            <li>${__("Google Authenticator: tap +, then Scan a QR code")}</li>
+                            <li>${__("Microsoft Authenticator: tap +, then Other account (Google, Facebook, etc.)")}</li>
+                        </ul>
                         <p style="text-align:center"><img src="data:image/svg+xml;base64,${r.message}"></p>
                         <p class="text-muted small">${__("Make sure nobody else can see your screen. This code works for 10 minutes, only on this attempt.")}</p>`,
                 },
