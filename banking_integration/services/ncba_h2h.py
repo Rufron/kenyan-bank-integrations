@@ -114,7 +114,6 @@ def generate_h2h_file(bank_transfers):
     seq_key = frappe.cache.make_key(f"ncba_h2h_seq:{nowdate()}")
     seq = frappe.cache.incr(seq_key)
     frappe.cache.expire(seq_key, 2 * 86400)
-    # NCBA: S2S6249 = SDSC, then date + 3-digit daily sequence, "_E" suffix.
-    # Their email says YYMMDD, but its example S2S1006181126001_E was sent 18 Nov 2026, i.e. DDMMYY.
-    filename = f"S2S6249{getdate(nowdate()).strftime('%d%m%y')}{seq:03d}_E.txt"
+    # NCBA: S2S6249 = SDSC, then YYMMDD + 3-digit daily sequence + "_E" (confirmed by NCBA, 24 Nov 2026).
+    filename = f"S2S6249{getdate(nowdate()).strftime('%y%m%d')}{seq:03d}_E.txt"
     return {"filename": filename, "content": "\r\n".join(lines) + "\r\n", "count": len(lines)}
