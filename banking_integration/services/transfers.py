@@ -650,7 +650,7 @@ def _build_jenga_swift_payload(
             "name": doc.beneficiary_name,
             "bankBic": doc.bank_bic,
             "accountNumber": doc.beneficiary_account_number,
-            "addressline1": doc.beneficiary_address,
+            "addressline1": ", ".join((doc.beneficiary_address or "").splitlines()),
         },
 
         "transfer": {
@@ -970,16 +970,35 @@ def _build_stanbic_pesalink_payload(doc, source, reference):
     return payload
 
 
+def _party_address(doc):
+    """Primary Address of the paid party, via the Payment Entry; {} when there is none."""
+    from frappe.contacts.doctype.address.address import get_default_address
+
+    if doc.reference_doctype != "Payment Entry" or not doc.reference_name:
+        return {}
+    party_type, party = frappe.db.get_value("Payment Entry", doc.reference_name, ["party_type", "party"])
+    name = party and get_default_address(party_type, party)
+    return frappe.db.get_value(
+        "Address", name, ["address_line1", "address_line2", "city", "pincode"], as_dict=True
+    ) if name else {}
+
+
 def _build_stanbic_swift_payload(doc, source, reference):
     narrative, payload = _stanbic_common(doc, reference, "SWIFT Payment")
     if not doc.bank_bic:
         frappe.throw(_("The beneficiary's Bank needs a SWIFT number for SWIFT payments."))
+    if not doc.beneficiary_address:
+        frappe.throw(_("SWIFT payments need the beneficiary's address: add a primary Address to the supplier."))
+    mobile = _stanbic_mobile(source.get("custom_sender_mobile_number"))
+    if not mobile:
+        frappe.throw(_("Set Sender Mobile Number on Bank Account {0} for SWIFT payments.").format(source.name))
+    address = _party_address(doc)
     payload.update({
         "originatorAccount": {
             "identification": {
                 "identification": source.bank_account_no,
                 "debitCurrency": doc.currency or "KES",
-                "mobileNumber": _stanbic_mobile(source.get("custom_sender_mobile_number")),
+                "mobileNumber": mobile,
             }
         },
         "transferTransactionInformation": {
@@ -996,8 +1015,12 @@ def _build_stanbic_swift_payload(doc, source, reference):
             },
             "counterparty": {
                 "name": doc.beneficiary_name,
+                # Street in addressLine, town and postCode separately, as in Stanbic's SWIFT spec.
                 "postalAddress": {
-                    "addressLine": doc.beneficiary_address or "KENYA",
+                    "addressLine": ", ".join(filter(None, [address.get("address_line1"), address.get("address_line2")]))
+                    or ", ".join(doc.beneficiary_address.splitlines()),
+                    "postCode": address.get("pincode") or "",
+                    "town": address.get("city") or "",
                     "country": doc.beneficiary_country or "KE",
                 },
             },

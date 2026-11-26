@@ -207,6 +207,8 @@ def _create_transfer(doc, source_account, destination_account, beneficiary_name)
     # Create using the Bank Transfer's official mechanism
     # ---------------------------------------------------------
 
+    country, address = _beneficiary_address(doc)
+
     transfer = create_from_reference(
         reference_doctype="Payment Entry",
         reference_name=doc.name,
@@ -229,7 +231,8 @@ def _create_transfer(doc, source_account, destination_account, beneficiary_name)
         sender_country_code="KE",
 
         beneficiary_name=beneficiary_name,
-        beneficiary_country="KE",
+        beneficiary_country=country,
+        beneficiary_address=address,
 
         beneficiary_account_number=(
             destination.get("bank_account_no")
@@ -247,6 +250,21 @@ def _create_transfer(doc, source_account, destination_account, beneficiary_name)
     )
 
     return transfer.name
+
+
+def _beneficiary_address(doc):
+    """(ISO country code, address lines) from the party's primary address; Kenya when it has none."""
+    from frappe.contacts.doctype.address.address import get_default_address
+
+    name = doc.payment_type != "Internal Transfer" and doc.party and get_default_address(doc.party_type, doc.party)
+    if not name:
+        return "KE", None
+    a = frappe.db.get_value(
+        "Address", name, ["address_line1", "address_line2", "city", "pincode", "country"], as_dict=True
+    )
+    code = (frappe.db.get_value("Country", a.country, "code") or "ke").upper()
+    lines = [a.address_line1, a.address_line2, " ".join(filter(None, [a.city, a.pincode])), a.country]
+    return code, "\n".join(line for line in lines if line)
 
 
 def get_party_bank_account(
