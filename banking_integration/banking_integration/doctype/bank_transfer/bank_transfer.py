@@ -411,17 +411,14 @@ def finish_authenticator_setup(otp: str):
 
 
 def _alert_authenticator_change(user, what):
-    """Tell the approver and System Managers, so an unexpected link or reset gets noticed."""
-    from frappe.utils.user import get_system_managers
-
+    """Email only the approver (and note it on their User record), so an unexpected link or reset gets noticed."""
     message = _(
         "The bank transfer approval authenticator for {0} was {1} by {2} at {3}. "
         "If this was not expected, have a System Manager reset it immediately."
     ).format(user, what, frappe.session.user, frappe.utils.now_datetime().strftime("%Y-%m-%d %H:%M"))
     frappe.get_doc("User", user).add_comment("Info", message)
-    recipients = {frappe.db.get_value("User", user, "email"), *get_system_managers(only_name=True)}
     frappe.sendmail(
-        recipients=[r for r in recipients if r and r not in ("Administrator", "admin@example.com")],
+        recipients=[frappe.db.get_value("User", user, "email")],
         subject=_("Bank transfer authenticator {0}: {1}").format(what, user),
         message=message,
     )
