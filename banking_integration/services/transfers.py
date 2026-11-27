@@ -1100,18 +1100,18 @@ def _build_stanbic_rtgs_payload(
         (doc.description or "RTGS Payment").split()
     )[:35]
 
+    # T24 blanks DEBIT.THEIR.REF if the originator mobile is empty and
+    # rejects with "INPUT MISSING", so stop before sending.
+    mobile = _stanbic_mobile(source.get("custom_sender_mobile_number") or doc.sender_mobile_number)
+    if not mobile:
+        frappe.throw(_("Set Sender Mobile Number on Bank Account {0} for RTGS payments.").format(source.name))
+
     return {
         "originatorAccount": {
             "identification": {
                 "identification": source.bank_account_no,
                 "debitCurrency": doc.currency or "KES",
-                # T24 blanks DEBIT.THEIR.REF if the originator mobile is
-                # empty, so it must be populated for RTGS. Comes from the
-                # source Bank Account (custom_sender_mobile_number).
-                "mobileNumber": _stanbic_mobile(
-                    source.get("custom_sender_mobile_number")
-                    or doc.sender_mobile_number
-                ),
+                "mobileNumber": mobile,
             }
         },
 
